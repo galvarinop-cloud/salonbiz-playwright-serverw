@@ -46,8 +46,8 @@ async function saveCookies(context) {
 }
 
 /**
- * More robust login that works across slightly different SalonBiz login pages.
- * If already logged in, it returns quickly.
+ * Robust-ish SalonBiz login.
+ * If already logged in, returns quickly (no password input found).
  */
 async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
@@ -57,32 +57,54 @@ async function loginIfNeeded(page) {
     waitUntil: "domcontentloaded"
   });
 
-  // Let any SPA/login widgets finish loading
   await page.waitForTimeout(1500);
 
-  // If password input doesn't exist, assume we're already logged in
   const passwordCount = await page.locator('input[type="password"]').count();
   if (passwordCount === 0) return;
 
-  // Try common username/email field patterns
-  const emailOrUser = page
-    .locator(
-      'input[type="email"], input[name*="user" i], input[name*="email" i], input[placeholder*="email" i], input[placeholder*="user" i], input[type="text"]'
-    )
-    .first();
+  // Prefer explicit Username/Email fields first, then fall back
+  const usernameCandidates = [
+    page.getByLabel(/username/i),
+    page.getByLabel(/email/i),
+    page.locator('input[name="username"]'),
+    page.locator('input[name="email"]'),
+    page.locator('input[id*="user" i]'),
+    page.locator('input[id*="email" i]'),
+    page.locator('input[placeholder*="username" i]'),
+    page.locator('input[placeholder*="email" i]'),
+    page.locator('input[type="email"]'),
+    page.locator('input[type="text"]')
+  ];
+
+  let userInput = null;
+  for (const c of usernameCandidates) {
+    try {
+      if ((await c.count()) > 0) {
+        userInput = c.first();
+        break;
+      }
+    } catch {}
+  }
 
   const passInput = page.locator('input[type="password"]').first();
 
-  await emailOrUser.click({ timeout: 5000 }).catch(() => {});
-  await emailOrUser.fill(SALONBIZ_USERNAME);
+  if (!userInput) {
+    throw new Error("Could not find username/email input on login page.");
+  }
+
+  // Clear + type (type with small delay tends to work better with some JS validators)
+  await userInput.click({ timeout: 5000 }).catch(() => {});
+  await userInput.fill("");
+  await userInput.type(String(SALONBIZ_USERNAME), { delay: 20 });
 
   await passInput.click({ timeout: 5000 }).catch(() => {});
-  await passInput.fill(SALONBIZ_PASSWORD);
+  await passInput.fill("");
+  await passInput.type(String(SALONBIZ_PASSWORD), { delay: 20 });
 
-  // Click the first visible "login" style button, else submit via Enter
+  // Submit
   const loginBtn = page
     .locator(
-      'button:has-text("Log in"), button:has-text("Login"), button:has-text("Sign in"), input[type="submit"]'
+      'button:has-text("Log in"), button:has-text("Login"), button:has-text("Sign in"), input[type="submit"], button[type="submit"]'
     )
     .first();
 
@@ -92,13 +114,10 @@ async function loginIfNeeded(page) {
     await page.keyboard.press("Enter");
   }
 
-  // Give time for redirect/app load
   await page.waitForTimeout(3000);
 }
 
 // ---- Vapi tool-call helpers ----
-// Vapi Function tool webhooks must respond with:
-// { results: [{ toolCallId, result }] }
 function extractToolCall(req) {
   return (
     req.body?.message?.toolCallList?.[0] ||
@@ -116,10 +135,8 @@ function extractArgs(req) {
   const toolCall = extractToolCall(req);
   const raw = toolCall?.function?.arguments;
 
-  // Sometimes Vapi sends args as an object
   if (raw && typeof raw === "object") return raw;
 
-  // Sometimes args come as a JSON string
   if (typeof raw === "string") {
     try {
       return JSON.parse(raw);
@@ -146,12 +163,12 @@ function vapiError(res, toolCallId, message, statusCode = 400) {
   return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
-// ---- basic health ----
+// ---- health ----
 app.get("/health", (req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
-// ---- Availability tool endpoint ----
+// ---- availability ----
 app.post("/availability", (req, res) => {
   console.log("AVAILABILITY WEBHOOK BODY:", JSON.stringify(req.body));
 
@@ -171,7 +188,7 @@ app.post("/availability", (req, res) => {
 
   const bookingDateAndTime = args?.bookingDateAndTime;
 
-  // TODO: Replace with real availability logic.
+  // TODO: Replace with real availability logic
   return vapiRespond(res, toolCallId, {
     ok: true,
     available: true,
@@ -179,7 +196,7 @@ app.post("/availability", (req, res) => {
   });
 });
 
-// ---- Book tool endpoint ----
+// ---- book ----
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -225,7 +242,6 @@ app.post("/book", async (req, res) => {
     await saveCookies(context);
 
     // TODO: implement booking selectors for SalonBiz backoffice.
-    // IMPORTANT: return ok:false so the assistant does not claim booking succeeded.
     return vapiRespond(res, toolCallId, {
       ok: false,
       status: "not_implemented",
@@ -250,7 +266,7 @@ app.post("/book", async (req, res) => {
   }
 });
 
-// ---- Cancel tool endpoint ----
+// ---- cancel ----
 app.post("/cancel", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -288,7 +304,6 @@ app.post("/cancel", async (req, res) => {
     await saveCookies(context);
 
     // TODO: implement cancel selectors for SalonBiz backoffice.
-    // IMPORTANT: return ok:false so the assistant does not claim cancel succeeded.
     return vapiRespond(res, toolCallId, {
       ok: false,
       status: "not_implemented",
@@ -311,7 +326,7 @@ app.post("/cancel", async (req, res) => {
   }
 });
 
-// ---- Debug: one-off screenshot (returns PNG directly) ----
+// ---- debug: screenshot (returns PNG) ----
 app.get("/debug/screenshot", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -341,7 +356,7 @@ app.get("/debug/screenshot", async (req, res) => {
   }
 });
 
-// ---- Debug: persist a screenshot to /tmp and view it via URL ----
+// ---- debug: persist screenshot to /tmp/salonbiz.png ----
 app.get("/debug/salonbiz", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -376,7 +391,7 @@ app.get("/debug/salonbiz.png", (req, res) => {
   return res.sendFile("/tmp/salonbiz.png");
 });
 
-// ---- Debug: login before/after screenshots ----
+// ---- debug: login before/after screenshots ----
 app.get("/debug/login", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
