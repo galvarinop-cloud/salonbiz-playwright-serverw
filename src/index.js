@@ -229,7 +229,7 @@ app.post("/book", async (req, res) => {
       ok: false,
       status: "not_implemented",
       message:
-        "Booking automation not implemented yet. Login works; next step is clicking Create and driving the create-appointment UI.",
+        "Booking automation not implemented yet. Login works; create form is reachable; next step is selecting service/staff/start/length/resource and saving.",
       mapped: {
         client: { firstName, lastName, phone: customerPhone || "" },
         serviceName: service,
@@ -480,7 +480,6 @@ app.get("/debug/click_slot", async (req, res) => {
     await page.waitForTimeout(2500);
     await page.screenshot({ path: "/tmp/slot_before.png", fullPage: true });
 
-    // Click somewhere in the calendar grid area (we'll tune this after we see what opens)
     await page.mouse.click(750, 420);
 
     await page.waitForTimeout(1500);
@@ -530,9 +529,10 @@ app.get("/debug/click_create", async (req, res) => {
     await page.waitForTimeout(2500);
     await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
 
-    // Try the Create button (robust text match)
     const createBtn = page
-      .locator('button:has-text("Create"), button:has-text("New"), button:has-text("Add")')
+      .locator(
+        'button:has-text("Create"), button:has-text("New"), button:has-text("Add")'
+      )
       .first();
 
     await createBtn.click({ timeout: 10000 });
@@ -560,6 +560,124 @@ app.get("/debug/create_before.png", (req, res) => {
 
 app.get("/debug/create_after.png", (req, res) => {
   return res.sendFile("/tmp/create_after.png");
+});
+
+// ---- debug: open Create form and return DOM snippet + screenshot ----
+app.get("/debug/create_dom", async (req, res) => {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const { context, page } = await getPage(browser);
+
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
+
+    await page.waitForTimeout(2500);
+
+    const createBtn = page
+      .locator(
+        'button:has-text("Create"), button:has-text("New"), button:has-text("Add")'
+      )
+      .first();
+
+    await createBtn.click({ timeout: 10000 });
+    await page.waitForTimeout(2000);
+
+    await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
+
+    const html = await page.content();
+    return res.status(200).json({
+      ok: true,
+      url: page.url(),
+      htmlSnippet: html.slice(0, 90000)
+    });
+  } catch (e) {
+    console.error("DEBUG /debug/create_dom error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/create_form.png", (req, res) => {
+  return res.sendFile("/tmp/create_form.png");
+});
+
+// ---- debug: fill the Service field using typeahead and screenshot ----
+app.get("/debug/fill_service", async (req, res) => {
+  const service = String(req.query.service || "Haircut");
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const { context, page } = await getPage(browser);
+
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
+    await page.waitForTimeout(2500);
+
+    // Open Create
+    const createBtn = page
+      .locator('button:has-text("Create"), button:has-text("New"), button:has-text("Add")')
+      .first();
+    await createBtn.click({ timeout: 10000 });
+    await page.waitForTimeout(2000);
+
+    // Try to find the Service input by placeholder/aria-label
+    const serviceInput = page
+      .locator('input[placeholder*="Service" i], input[aria-label*="Service" i]')
+      .first();
+
+    await serviceInput.waitFor({ state: "visible", timeout: 15000 });
+    await serviceInput.click();
+    await serviceInput.fill("");
+    await serviceInput.type(service, { delay: 40 });
+
+    // Wait for suggestions
+    await page.waitForTimeout(800);
+
+    // Choose first suggestion
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+
+    await page.waitForTimeout(800);
+    await page.screenshot({ path: "/tmp/fill_service.png", fullPage: true });
+
+    return res.status(200).json({
+      ok: true,
+      message: "Filled service. Open /debug/fill_service.png to verify.",
+      service
+    });
+  } catch (e) {
+    console.error("DEBUG /debug/fill_service error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/fill_service.png", (req, res) => {
+  return res.sendFile("/tmp/fill_service.png");
 });
 
 app.listen(PORT, () => {
