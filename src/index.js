@@ -44,8 +44,7 @@ async function saveCookies(context) {
 }
 
 /**
- * SalonBiz login.
- * Uses Angular-friendly value setting + input/change events.
+ * SalonBiz login (Angular-friendly).
  */
 async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
@@ -67,7 +66,6 @@ async function loginIfNeeded(page) {
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
   await page.waitForSelector(passSel, { state: "visible", timeout: 15000 });
 
-  // Set values and fire events that Angular listens to
   await page.evaluate(
     ({ userSel, passSel, username, password }) => {
       const user = document.querySelector(userSel);
@@ -96,33 +94,35 @@ async function loginIfNeeded(page) {
   );
 
   await page.click(submitSel);
-
   await page.waitForTimeout(4000);
 }
 
 /**
- * Opens the appointment create panel by clicking the scheduler DATA area.
- * This avoids the left time-axis and other gutters.
+ * Click the top-right pink "Create" button by coordinate (relative to viewport).
+ * We click in the header area near the right side, slightly below the top edge.
+ *
+ * Tune via env vars if needed:
+ * - CREATE_CLICK_X_PCT (default 0.90)
+ * - CREATE_CLICK_Y_PCT (default 0.085)
  */
-async function openCreatePanelByClickingGrid(page) {
-  const data = page.locator("#dhtmlxScheduler .dhx_cal_data").first();
-  await data.waitFor({ state: "visible", timeout: 15000 });
+async function clickPinkCreateButton(page) {
+  const vp = page.viewportSize() || { width: 1280, height: 720 };
 
-  const box = await data.boundingBox();
-  if (!box) throw new Error("Scheduler data area bounding box not found");
+  const xPct = Number(process.env.CREATE_CLICK_X_PCT || 0.9);
+  const yPct = Number(process.env.CREATE_CLICK_Y_PCT || 0.085);
 
-  // Click ~85% down the grid (often empty late-day area)
-  const x = box.x + box.width * 0.6; // middle-right
-  const y = box.y + box.height * 0.85; // late day
+  const x = Math.floor(vp.width * xPct);
+  const y = Math.floor(vp.height * yPct);
 
   await page.mouse.click(x, y);
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(1500);
+
+  return { x, y, vp, xPct, yPct };
 }
 
 /**
- * Ensures the create panel is open by:
- * 1) checking if service input is visible
- * 2) if not, clicking scheduler grid data area to open it
+ * Ensure appointment create panel is open by clicking pink Create,
+ * then waiting for Service input.
  */
 async function ensureCreatePanelOpen(page) {
   const serviceInput = page
@@ -131,57 +131,12 @@ async function ensureCreatePanelOpen(page) {
     .first();
 
   const visibleNow = await serviceInput.isVisible().catch(() => false);
-  if (!visibleNow) {
-    await openCreatePanelByClickingGrid(page);
-  }
+  if (visibleNow) return serviceInput;
 
-  await serviceInput.waitFor({ state: "visible", timeout: 15000 });
+  await clickPinkCreateButton(page);
+
+  await serviceInput.waitFor({ state: "visible", timeout: 20000 });
   return serviceInput;
-}
-
-// ---- Vapi tool-call helpers ----
-function extractToolCall(req) {
-  return (
-    req.body?.message?.toolCallList?.[0] ||
-    req.body?.message?.toolCalls?.[0] ||
-    null
-  );
-}
-
-function extractToolCallId(req) {
-  const toolCall = extractToolCall(req);
-  return toolCall?.id || null;
-}
-
-function extractArgs(req) {
-  const toolCall = extractToolCall(req);
-  const raw = toolCall?.function?.arguments;
-
-  if (raw && typeof raw === "object") return raw;
-
-  if (typeof raw === "string") {
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return {};
-    }
-  }
-  return {};
-}
-
-function vapiRespond(res, toolCallId, result, statusCode = 200) {
-  return res.status(statusCode).json({
-    results: [
-      {
-        toolCallId,
-        result
-      }
-    ]
-  });
-}
-
-function vapiError(res, toolCallId, message, statusCode = 400) {
-  return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
 // ---- health ----
@@ -189,214 +144,16 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
-// ---- availability ----
-app.post("/availability", (req, res) => {
-  console.log("AVAILABILITY WEBHOOK BODY:", JSON.stringify(req.body));
-  const toolCall = extractToolCall(req);
-  const toolCallId = toolCall?.id || null;
-
-  let args = toolCall?.function?.arguments;
-  if (typeof args === "string") {
-    try {
-      args = JSON.parse(args);
-    } catch {
-      args = {};
-    }
-  } else if (!args || typeof args !== "object") {
-    args = {};
-  }
-
-  const bookingDateAndTime = args?.bookingDateAndTime;
-
-  return vapiRespond(res, toolCallId, {
-    ok: true,
-    available: true,
-    bookingDateAndTime
-  });
-});
-
-// ---- book ----
-app.post("/book", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  const args = extractArgs(req);
-
-  const {
-    customerName,
-    customerPhone,
-    service,
-    stylist,
-    date,
-    time,
-    timezone,
-    notes,
-    email
-  } = args;
-
-  if (!customerName) return vapiError(res, toolCallId, "customerName required");
-  if (!service) return vapiError(res, toolCallId, "service required");
-  if (!date) return vapiError(res, toolCallId, "date required");
-  if (!time) return vapiError(res, toolCallId, "time required");
-  if (!timezone) return vapiError(res, toolCallId, "timezone required");
-
-  const parts = String(customerName).trim().split(/\s+/).filter(Boolean);
-  const firstName = parts[0] || "";
-  const lastName = parts.slice(1).join(" ") || "";
-
-  if (!firstName || !lastName) {
-    return vapiError(
-      res,
-      toolCallId,
-      "customerName must include first and last name"
-    );
-  }
-
-  const startIso = `${date}T${time}`;
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    return vapiRespond(res, toolCallId, {
-      ok: false,
-      status: "not_implemented",
-      message:
-        "Booking automation not implemented yet. Login works; right panel form is reachable; next step is selecting service/staff/start/length/res/notes and saving.",
-      mapped: {
-        client: { firstName, lastName, phone: customerPhone || "" },
-        serviceName: service,
-        staffName: stylist || "Any",
-        startIso,
-        timezone,
-        notes: notes || null,
-        email: email || null
-      }
-    });
-  } catch (e) {
-    console.error("BOOK error:", e);
-    return vapiRespond(
-      res,
-      toolCallId,
-      { ok: false, error: e?.message || String(e) },
-      500
-    );
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-// ---- cancel ----
-app.post("/cancel", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  const args = extractArgs(req);
-
-  const {
-    customerName,
-    customerPhone,
-    date,
-    time,
-    timezone,
-    notes,
-    confirmationRequired
-  } = args;
-
-  if (!confirmationRequired) {
-    return vapiError(res, toolCallId, "confirmationRequired must be true");
-  }
-  if (!customerName) return vapiError(res, toolCallId, "customerName required");
-  if (!date) return vapiError(res, toolCallId, "date required");
-  if (!time) return vapiError(res, toolCallId, "time required");
-  if (!timezone) return vapiError(res, toolCallId, "timezone required");
-
-  const startIso = `${date}T${time}`;
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    return vapiRespond(res, toolCallId, {
-      ok: false,
-      status: "not_implemented",
-      message:
-        "Cancel automation not implemented yet. Login works; next step is finding the appointment and cancel flow selectors.",
-      mapped: {
-        customerName,
-        customerPhone: customerPhone || null,
-        startIso,
-        timezone,
-        notes: notes || null
-      }
-    });
-  } catch (e) {
-    console.error("CANCEL error:", e);
-    return vapiRespond(
-      res,
-      toolCallId,
-      { ok: false, error: e?.message || String(e) },
-      500
-    );
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-// ---- debug: screenshot (returns PNG) ----
-app.get("/debug/screenshot", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
-
-    const buf = await page.screenshot({ fullPage: true });
-    res.setHeader("Content-Type", "image/png");
-    return res.status(200).send(buf);
-  } catch (e) {
-    console.error("DEBUG screenshot error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-// ---- debug: click a scheduler grid cell and screenshot before/after ----
-app.get("/debug/click_slot", async (req, res) => {
+// ---- debug: click pink create + before/after screenshots ----
+app.get("/debug/click_create", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
 
   const { context, page } = await getPage(browser);
-
   let step = "start";
+
   try {
     if (cookiesExpired()) cookieState = null;
 
@@ -408,31 +165,35 @@ app.get("/debug/click_slot", async (req, res) => {
     await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
       waitUntil: "domcontentloaded"
     });
-
     await page.waitForTimeout(2500);
-    await page.screenshot({ path: "/tmp/slot_before.png", fullPage: true });
 
-    step = "click scheduler data area";
-    await openCreatePanelByClickingGrid(page);
+    step = "screenshot before";
+    await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
 
-    // Validate create panel actually opened
+    step = "click pink create";
+    const click = await clickPinkCreateButton(page);
+
     step = "verify service input visible";
-    await page
+    const serviceVisible = await page
       .locator("sbiz-book-right-panel")
       .locator('input[formcontrolname="service"]')
       .first()
-      .waitFor({ state: "visible", timeout: 15000 });
+      .isVisible()
+      .catch(() => false);
 
-    await page.screenshot({ path: "/tmp/slot_after.png", fullPage: true });
+    step = "screenshot after";
+    await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
 
     return res.status(200).json({
       ok: true,
+      click,
+      serviceVisible,
       message:
-        "Saved /tmp/slot_before.png and /tmp/slot_after.png. Open /debug/slot_before.png and /debug/slot_after.png"
+        "Open /debug/create_before.png and /debug/create_after.png to confirm it clicked the pink Create button."
     });
   } catch (e) {
-    console.error("DEBUG /debug/click_slot error at step:", step, e);
-    await page.screenshot({ path: "/tmp/slot_error.png", fullPage: true }).catch(() => {});
+    console.error("DEBUG /debug/click_create error at step:", step, e);
+    await page.screenshot({ path: "/tmp/create_error.png", fullPage: true }).catch(() => {});
     return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
   } finally {
     await context.close().catch(() => {});
@@ -440,72 +201,11 @@ app.get("/debug/click_slot", async (req, res) => {
   }
 });
 
-app.get("/debug/slot_before.png", (req, res) => {
-  return res.sendFile("/tmp/slot_before.png");
-});
+app.get("/debug/create_before.png", (req, res) => res.sendFile("/tmp/create_before.png"));
+app.get("/debug/create_after.png", (req, res) => res.sendFile("/tmp/create_after.png"));
+app.get("/debug/create_error.png", (req, res) => res.sendFile("/tmp/create_error.png"));
 
-app.get("/debug/slot_after.png", (req, res) => {
-  return res.sendFile("/tmp/slot_after.png");
-});
-
-app.get("/debug/slot_error.png", (req, res) => {
-  return res.sendFile("/tmp/slot_error.png");
-});
-
-// ---- debug: open Create + dump right panel snippet ----
-app.get("/debug/create_dom", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-  let step = "start";
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    step = "login";
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    step = "goto appointmentbook";
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
-    await page.waitForTimeout(2500);
-
-    step = "ensure create panel open";
-    await ensureCreatePanelOpen(page);
-
-    step = "screenshot";
-    await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
-
-    step = "extract right panel html";
-    const panelHtml = await page
-      .locator("sbiz-book-right-panel")
-      .evaluate((el) => el.innerHTML);
-
-    return res.status(200).json({
-      ok: true,
-      step,
-      url: page.url(),
-      rightPanelHtmlSnippet: String(panelHtml).slice(0, 180000)
-    });
-  } catch (e) {
-    console.error("DEBUG /debug/create_dom error at step:", step, e);
-    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/create_form.png", (req, res) => {
-  return res.sendFile("/tmp/create_form.png");
-});
-
-// ---- debug: fill the Service field using typeahead ----
+// ---- debug: fill service (clicks pink create first) ----
 app.get("/debug/fill_service", async (req, res) => {
   const service = String(req.query.service || "Shape Me Haircut");
 
@@ -547,24 +247,21 @@ app.get("/debug/fill_service", async (req, res) => {
 
     step = "screenshot";
     const buf = await page.screenshot({ fullPage: true });
-
     res.setHeader("Content-Type", "image/png");
     return res.status(200).send(buf);
   } catch (e) {
     console.error("DEBUG /debug/fill_service error at step:", step, e);
-    await page
-      .screenshot({ path: "/tmp/fill_service_error.png", fullPage: true })
-      .catch(() => {});
-    return res.status(500).json({
-      ok: false,
-      step,
-      error: e?.message || String(e)
-    });
+    await page.screenshot({ path: "/tmp/fill_service_error.png", fullPage: true }).catch(() => {});
+    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
 });
+
+app.get("/debug/fill_service_error.png", (req, res) =>
+  res.sendFile("/tmp/fill_service_error.png")
+);
 
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
