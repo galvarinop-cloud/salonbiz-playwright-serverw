@@ -488,7 +488,7 @@ app.get("/debug/click_slot", async (req, res) => {
     return res.status(200).json({
       ok: true,
       message:
-        "Saved /tmp/slot_before.png and /debug/slot_before.png and /debug/slot_after.png"
+        "Saved /tmp/slot_before.png and /tmp/slot_after.png. Open /debug/slot_before.png and /debug/slot_after.png"
     });
   } catch (e) {
     console.error("DEBUG /debug/click_slot error:", e);
@@ -529,6 +529,7 @@ app.get("/debug/click_create", async (req, res) => {
     await page.waitForTimeout(2500);
     await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
 
+    // Try the Create button (robust text match)
     const createBtn = page
       .locator(
         'button:has-text("Create"), button:has-text("New"), button:has-text("Add")'
@@ -638,7 +639,7 @@ app.get("/debug/create_form.png", (req, res) => {
 
 // ---- debug: fill the Service field using typeahead and return a screenshot directly ----
 app.get("/debug/fill_service", async (req, res) => {
-  const service = String(req.query.service || "Haircut");
+  const service = String(req.query.service || "Shape Me Haircut");
 
   const browser = await chromium.launch({
     headless: true,
@@ -674,16 +675,21 @@ app.get("/debug/fill_service", async (req, res) => {
 
     step = "find service input";
     const serviceInput = page
-      .locator("body")
-      .locator('input[placeholder*="Service" i], input[aria-label*="Service" i]')
+      .locator("sbiz-book-right-panel")
+      .locator('input[formcontrolname="service"]')
       .first();
 
     await serviceInput.waitFor({ state: "visible", timeout: 15000 });
 
     step = "type service";
     await serviceInput.click();
-    await serviceInput.fill("");
-    await serviceInput.type(service, { delay: 40 });
+
+    // Select all, then type (more reliable for these typeahead widgets)
+    await page.keyboard.down("Control");
+    await page.keyboard.press("KeyA");
+    await page.keyboard.up("Control");
+
+    await page.keyboard.type(service, { delay: 40 });
 
     step = "select suggestion";
     await page.waitForTimeout(800);
