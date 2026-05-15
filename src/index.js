@@ -64,6 +64,7 @@ async function loginIfNeeded(page) {
   const passSel = 'input[formcontrolname="password"]';
   const submitSel = 'button[type="submit"]';
 
+  // Already logged in
   if ((await page.locator(passSel).count()) === 0) return;
 
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
@@ -175,7 +176,7 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
 
   const { firstName, lastName } = splitName(customerName);
   if (!firstName || !lastName) {
-    throw new Error("customerName must include first and last name for new client creation");
+    throw new Error("customerName must include first + last name for new client creation");
   }
 
   await setTextInput(modal.locator('input[formcontrolname="firstName"]').first(), firstName);
@@ -186,7 +187,11 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
     await setTextInput(modal.locator('input[formcontrolname="email"]').first(), customerEmail);
   }
 
-  await modal.locator('button[type="submit"]:has-text("Create")').first().click({ timeout: 15000 });
+  await modal
+    .locator('button[type="submit"]:has-text("Create")')
+    .first()
+    .click({ timeout: 15000 });
+
   await modal.waitFor({ state: "hidden", timeout: 20000 });
   await page.waitForTimeout(800);
 }
@@ -264,7 +269,7 @@ app.post("/availability", (req, res) => {
   });
 });
 
-// ---- core booking runner (used by /book and debug routes) ----
+// ---- core booking runner ----
 async function runBooking(page, {
   isNewClient,
   customerName,
@@ -450,7 +455,7 @@ app.get("/debug/click_create", async (req, res) => {
 
     await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
 
-    return app.response.json.call(res, { ok: true, click, serviceVisible });
+    return res.status(200).json({ ok: true, click, serviceVisible });
   } catch (e) {
     await page.screenshot({ path: "/tmp/create_error.png", fullPage: true }).catch(() => {});
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -551,7 +556,7 @@ app.get("/debug/new_client_error.png", (req, res) =>
   res.sendFile("/tmp/new_client_error.png")
 );
 
-// ---- NEW: debug runner for existing client booking ----
+// ---- debug runner (existing client) ----
 app.get("/debug/run_book_existing", async (req, res) => {
   const customerName = String(req.query.name || "");
   const customerPhone = String(req.query.phone || "");
@@ -561,6 +566,13 @@ app.get("/debug/run_book_existing", async (req, res) => {
   const stylist = req.query.stylist ? String(req.query.stylist) : undefined;
   const requestReason = req.query.requestReason ? String(req.query.requestReason) : undefined;
 
+  if (!customerName || !customerPhone || !service || !startTime || !customDuration) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing required query params: name, phone, service, time, length"
+    });
+  }
+
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -569,15 +581,6 @@ app.get("/debug/run_book_existing", async (req, res) => {
 
   let step = "start";
   try {
-    step = "validate";
-    if (!customerName || !customerPhone || !service || !startTime || !customDuration) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          "Missing required query params: name, phone, service, time, length"
-      });
-    }
-
     step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
@@ -623,7 +626,7 @@ app.get("/debug/debug_run_existing_error.png", (req, res) =>
   res.sendFile("/tmp/debug_run_existing_error.png")
 );
 
-// ---- NEW: debug runner for new client booking ----
+// ---- debug runner (new client) ----
 app.get("/debug/run_book_new", async (req, res) => {
   const customerName = String(req.query.name || "");
   const customerPhone = String(req.query.phone || "");
@@ -634,6 +637,13 @@ app.get("/debug/run_book_new", async (req, res) => {
   const stylist = req.query.stylist ? String(req.query.stylist) : undefined;
   const requestReason = req.query.requestReason ? String(req.query.requestReason) : undefined;
 
+  if (!customerName || !customerPhone || !service || !startTime || !customDuration) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing required query params: name, phone, service, time, length"
+    });
+  }
+
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -642,15 +652,6 @@ app.get("/debug/run_book_new", async (req, res) => {
 
   let step = "start";
   try {
-    step = "validate";
-    if (!customerName || !customerPhone || !service || !startTime || !customDuration) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          "Missing required query params: name, phone, service, time, length"
-      });
-    }
-
     step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
@@ -697,3 +698,4 @@ app.get("/debug/debug_run_new_error.png", (req, res) =>
 
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
+});
