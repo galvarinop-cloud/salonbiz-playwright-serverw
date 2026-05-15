@@ -16,7 +16,7 @@ const SALONBIZ_BASE_URL =
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
 const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 
-// Click tuning via env vars (already working for you)
+// Click tuning via env vars (these are working for you now)
 const CREATE_CLICK_X_PCT = Number(process.env.CREATE_CLICK_X_PCT || 0.95);
 const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
 
@@ -47,6 +47,9 @@ async function saveCookies(context) {
   cookieStateSetAt = Date.now();
 }
 
+/**
+ * SalonBiz login (Angular-friendly).
+ */
 async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
@@ -61,6 +64,7 @@ async function loginIfNeeded(page) {
   const passSel = 'input[formcontrolname="password"]';
   const submitSel = 'button[type="submit"]';
 
+  // If already logged in, password field won't exist
   if ((await page.locator(passSel).count()) === 0) return;
 
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
@@ -135,28 +139,18 @@ async function setTextInput(inputLocator, value) {
 }
 
 async function clickRightPanelCreate(page) {
-  // The final submit button is a pink "Create" button on the right panel.
-  // Try several robust selectors.
   const candidates = [
-    page
-      .locator("sbiz-book-right-panel")
-      .locator('button:has-text("Create")'),
-    page
-      .locator("sbiz-book-right-panel")
-      .locator('button:has-text("CREATE")'),
-    page
-      .locator("sbiz-book-right-panel")
-      .locator('button.sb-edit-appointment__create-button'),
+    page.locator("sbiz-book-right-panel").locator('button:has-text("Create")'),
+    page.locator("sbiz-book-right-panel").locator('button:has-text("CREATE")'),
     page
       .locator("sbiz-book-right-panel")
       .locator('button[class*="create"]'),
-    page
-      .locator("sbiz-book-right-panel")
-      .locator('button[type="submit"]')
+    page.locator("sbiz-book-right-panel").locator('button[type="submit"]')
   ];
 
   for (const loc of candidates) {
-    if ((await loc.count().catch(() => 0)) > 0) {
+    const count = await loc.count().catch(() => 0);
+    if (count > 0) {
       const btn = loc.first();
       if (await btn.isVisible().catch(() => false)) {
         await btn.click({ timeout: 15000 });
@@ -216,7 +210,7 @@ app.post("/availability", (req, res) => {
   });
 });
 
-// ---- book (now actually fills fields + clicks create) ----
+// ---- book (first-pass automation) ----
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -262,9 +256,7 @@ app.post("/book", async (req, res) => {
 
     const panel = page.locator("sbiz-book-right-panel");
 
-    step = "client name";
-    // These selectors might vary; adjust after we confirm actual formcontrolname values.
-    // We try common patterns.
+    step = "client fields (best-effort)";
     const firstNameInput = panel.locator('input[formcontrolname="firstName"]').first();
     const lastNameInput = panel.locator('input[formcontrolname="lastName"]').first();
     const phoneInput = panel.locator('input[formcontrolname="phone"]').first();
@@ -282,7 +274,7 @@ app.post("/book", async (req, res) => {
     await serviceInput.waitFor({ state: "visible", timeout: 15000 });
     await typeaheadSelect(serviceInput, service);
 
-    step = "stylist (optional)";
+    step = "stylist (optional best-effort)";
     if (stylist) {
       const staffInput = panel
         .locator('input[formcontrolname="staff"], input[formcontrolname="stylist"]')
@@ -292,10 +284,13 @@ app.post("/book", async (req, res) => {
       }
     }
 
-    step = "start date/time";
-    // Common control names; adjust once we confirm.
-    const dateInput = panel.locator('input[formcontrolname="date"], input[formcontrolname="startDate"]').first();
-    const timeInput = panel.locator('input[formcontrolname="time"], input[formcontrolname="startTime"]').first();
+    step = "date/time (best-effort)";
+    const dateInput = panel
+      .locator('input[formcontrolname="date"], input[formcontrolname="startDate"]')
+      .first();
+    const timeInput = panel
+      .locator('input[formcontrolname="time"], input[formcontrolname="startTime"]')
+      .first();
 
     if ((await dateInput.count().catch(() => 0)) > 0) await setTextInput(dateInput, date);
     if ((await timeInput.count().catch(() => 0)) > 0) await setTextInput(timeInput, time);
@@ -308,24 +303,20 @@ app.post("/book", async (req, res) => {
       }
     }
 
-    step = "click final create";
+    step = "click right-panel final create";
     const clicked = await clickRightPanelCreate(page);
     if (!clicked) {
       await page.screenshot({ path: "/tmp/book_error.png", fullPage: true }).catch(() => {});
       throw new Error('Could not find/click the right-panel final "Create" button');
     }
 
-    step = "done screenshot";
     await page.waitForTimeout(1500);
     await page.screenshot({ path: "/tmp/book_after.png", fullPage: true }).catch(() => {});
 
     return vapiRespond(res, toolCallId, {
       ok: true,
-      step,
       message: "Attempted to create appointment. Verify in SalonBiz.",
-      debug: {
-        screenshots: ["/tmp/book_after.png"]
-      }
+      step
     });
   } catch (e) {
     console.error("BOOK error at step:", step, e);
@@ -342,7 +333,7 @@ app.post("/book", async (req, res) => {
   }
 });
 
-// ---- cancel (still stub) ----
+// ---- cancel (stub) ----
 app.post("/cancel", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   return vapiRespond(res, toolCallId, {
@@ -352,7 +343,7 @@ app.post("/cancel", async (req, res) => {
   });
 });
 
-// ---- debug: click create + before/after screenshots ----
+// ---- debug: click create ----
 app.get("/debug/click_create", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -406,6 +397,57 @@ app.get("/debug/click_create", async (req, res) => {
 app.get("/debug/create_before.png", (req, res) => res.sendFile("/tmp/create_before.png"));
 app.get("/debug/create_after.png", (req, res) => res.sendFile("/tmp/create_after.png"));
 app.get("/debug/create_error.png", (req, res) => res.sendFile("/tmp/create_error.png"));
+
+// ---- debug: dump right panel DOM ----
+app.get("/debug/create_dom", async (req, res) => {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const { context, page } = await getPage(browser);
+  let step = "start";
+
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    step = "login";
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    step = "goto appointmentbook";
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
+    await page.waitForTimeout(2500);
+
+    step = "open create panel";
+    await ensureCreatePanelOpen(page);
+
+    step = "screenshot";
+    await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
+
+    step = "extract right panel html";
+    const panelHtml = await page
+      .locator("sbiz-book-right-panel")
+      .evaluate((el) => el.innerHTML);
+
+    return res.status(200).json({
+      ok: true,
+      step,
+      url: page.url(),
+      rightPanelHtmlSnippet: String(panelHtml).slice(0, 180000)
+    });
+  } catch (e) {
+    console.error("DEBUG create_dom error at step:", step, e);
+    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/create_form.png", (req, res) => res.sendFile("/tmp/create_form.png"));
 
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
