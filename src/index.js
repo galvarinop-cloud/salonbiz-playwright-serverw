@@ -359,7 +359,51 @@ app.get("/debug/salonbiz", async (req, res) => {
 app.get("/debug/salonbiz.png", (req, res) => {
   return res.sendFile("/tmp/salonbiz.png");
 });
+app.get("/debug/login", async (req, res) => {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
 
+  const { context, page } = await getPage(browser);
+
+  try {
+    // Go to appointment book (forces auth page)
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
+
+    // Screenshot BEFORE filling
+    await page.screenshot({ path: "/tmp/login_before.png", fullPage: true });
+
+    // Try login
+    await loginIfNeeded(page);
+
+    // Wait a bit and screenshot AFTER login attempt
+    await page.waitForTimeout(2000);
+    await page.screenshot({ path: "/tmp/login_after.png", fullPage: true });
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        "Saved /tmp/login_before.png and /tmp/login_after.png. Open /debug/login_before.png and /debug/login_after.png"
+    });
+  } catch (e) {
+    console.error("DEBUG /debug/login error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/login_before.png", (req, res) => {
+  return res.sendFile("/tmp/login_before.png");
+});
+
+app.get("/debug/login_after.png", (req, res) => {
+  return res.sendFile("/tmp/login_after.png");
+});
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
 });
