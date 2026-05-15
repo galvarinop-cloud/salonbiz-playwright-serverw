@@ -89,16 +89,21 @@ function extractToolCallId(req) {
 
 function extractArgs(req) {
   const toolCall = extractToolCall(req);
-  let args = {};
+  const raw = toolCall?.function?.arguments;
 
-  try {
-    const raw = toolCall?.function?.arguments;
-    args = typeof raw === "string" ? JSON.parse(raw) : raw || {};
-  } catch {
-    args = {};
+  // In your logs, Vapi sends this as an object already
+  if (raw && typeof raw === "object") return raw;
+
+  // Sometimes it can be a JSON string
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
   }
 
-  return args;
+  return {};
 }
 
 function vapiRespond(res, toolCallId, result, statusCode = 200) {
@@ -123,11 +128,8 @@ app.get("/health", async (req, res) => {
 /**
  * Availability tool endpoint for:
  * Amare-Hair-salon-Check-Availability
- *
- * IMPORTANT: This must not throw, and must always return { results: [...] }.
  */
 app.post("/availability", (req, res) => {
-  // Log full webhook body so we can verify the exact shape
   console.log("AVAILABILITY WEBHOOK BODY:", JSON.stringify(req.body));
 
   const toolCallId = extractToolCallId(req);
@@ -137,11 +139,9 @@ app.post("/availability", (req, res) => {
     args.bookingDateAndTime || req.body?.bookingDateAndTime || null;
 
   if (!bookingDateAndTime) {
-    // Still respond in Vapi format
     return vapiError(res, toolCallId, "bookingDateAndTime required");
   }
 
-  // For now: always available
   return vapiRespond(res, toolCallId, {
     ok: true,
     available: true,
