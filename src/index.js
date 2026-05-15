@@ -4,7 +4,6 @@ import { chromium } from "playwright";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// Log every request (helps debugging on Railway)
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.url}`);
   next();
@@ -17,7 +16,6 @@ const SALONBIZ_BASE_URL =
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
 const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 
-// ---- cookie cache (to avoid logging in on every tool call) ----
 let cookieState = null;
 let cookieStateSetAt = 0;
 const COOKIE_TTL_MS = Number(process.env.COOKIE_TTL_MS || 1000 * 60 * 60 * 6);
@@ -45,10 +43,17 @@ async function saveCookies(context) {
   cookieStateSetAt = Date.now();
 }
 
-/**
- * Robust-ish SalonBiz login.
- * If already logged in, returns quickly (no password input found).
- */
+async function firstVisible(locator) {
+  const n = await locator.count();
+  for (let i = 0; i < n; i++) {
+    const item = locator.nth(i);
+    try {
+      if (await item.isVisible()) return item;
+    } catch {}
+  }
+  return null;
+}
+
 async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
@@ -59,11 +64,10 @@ async function loginIfNeeded(page) {
 
   await page.waitForTimeout(1500);
 
-  const passwordCount = await page.locator('input[type="password"]').count();
-  if (passwordCount === 0) return;
+  const passwordAny = page.locator('input[type="password"]');
+  if ((await passwordAny.count()) === 0) return;
 
-  // Prefer explicit Username/Email fields first, then fall back
-  const usernameCandidates = [
+  const userCandidates = [
     page.getByLabel(/username/i),
     page.getByLabel(/email/i),
     page.locator('input[name="username"]'),
@@ -77,31 +81,39 @@ async function loginIfNeeded(page) {
   ];
 
   let userInput = null;
-  for (const c of usernameCandidates) {
+  for (const c of userCandidates) {
     try {
-      if ((await c.count()) > 0) {
-        userInput = c.first();
+      const v = await firstVisible(c);
+      if (v) {
+        userInput = v;
         break;
       }
     } catch {}
   }
+  if (!userInput) throw new Error("Could not find visible username/email input.");
 
-  const passInput = page.locator('input[type="password"]').first();
+  const passInput = await firstVisible(passwordAny);
+  if (!passInput) throw new Error("Could not find visible password input.");
 
-  if (!userInput) {
-    throw new Error("Could not find username/email input on login page.");
+  // Type username
+  await userInput.scrollIntoViewIfNeeded().catch(() => {});
+  await userInput.click({ timeout: 5000 }).catch(() => {});
+  await userInput.fill("").catch(() => {});
+  await userInput.type(String(SALONBIZ_USERNAME), { delay: 30 });
+
+  // Type password (force focus + clear + type)
+  await passInput.scrollIntoViewIfNeeded().catch(() => {});
+  await passInput.click({ timeout: 5000, force: true }).catch(() => {});
+  await passInput.fill("").catch(() => {});
+  await passInput.type(String(SALONBIZ_PASSWORD), { delay: 30 });
+
+  // If it didn't stick, try again via page.keyboard
+  const passValue = await passInput.inputValue().catch(() => "");
+  if (!passValue) {
+    await passInput.focus().catch(() => {});
+    await page.keyboard.type(String(SALONBIZ_PASSWORD), { delay: 30 });
   }
 
-  // Clear + type (type with small delay tends to work better with some JS validators)
-  await userInput.click({ timeout: 5000 }).catch(() => {});
-  await userInput.fill("");
-  await userInput.type(String(SALONBIZ_USERNAME), { delay: 20 });
-
-  await passInput.click({ timeout: 5000 }).catch(() => {});
-  await passInput.fill("");
-  await passInput.type(String(SALONBIZ_PASSWORD), { delay: 20 });
-
-  // Submit
   const loginBtn = page
     .locator(
       'button:has-text("Log in"), button:has-text("Login"), button:has-text("Sign in"), input[type="submit"], button[type="submit"]'
@@ -114,10 +126,9 @@ async function loginIfNeeded(page) {
     await page.keyboard.press("Enter");
   }
 
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(4000);
 }
 
-// ---- Vapi tool-call helpers ----
 function extractToolCall(req) {
   return (
     req.body?.message?.toolCallList?.[0] ||
@@ -144,7 +155,6 @@ function extractArgs(req) {
       return {};
     }
   }
-
   return {};
 }
 
@@ -163,15 +173,12 @@ function vapiError(res, toolCallId, message, statusCode = 400) {
   return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
-// ---- health ----
 app.get("/health", (req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
-// ---- availability ----
 app.post("/availability", (req, res) => {
   console.log("AVAILABILITY WEBHOOK BODY:", JSON.stringify(req.body));
-
   const toolCall = extractToolCall(req);
   const toolCallId = toolCall?.id || null;
 
@@ -188,7 +195,6 @@ app.post("/availability", (req, res) => {
 
   const bookingDateAndTime = args?.bookingDateAndTime;
 
-  // TODO: Replace with real availability logic
   return vapiRespond(res, toolCallId, {
     ok: true,
     available: true,
@@ -196,7 +202,6 @@ app.post("/availability", (req, res) => {
   });
 });
 
-// ---- book ----
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -241,7 +246,6 @@ app.post("/book", async (req, res) => {
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    // TODO: implement booking selectors for SalonBiz backoffice.
     return vapiRespond(res, toolCallId, {
       ok: false,
       status: "not_implemented",
@@ -266,7 +270,6 @@ app.post("/book", async (req, res) => {
   }
 });
 
-// ---- cancel ----
 app.post("/cancel", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -303,7 +306,6 @@ app.post("/cancel", async (req, res) => {
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    // TODO: implement cancel selectors for SalonBiz backoffice.
     return vapiRespond(res, toolCallId, {
       ok: false,
       status: "not_implemented",
@@ -326,7 +328,6 @@ app.post("/cancel", async (req, res) => {
   }
 });
 
-// ---- debug: screenshot (returns PNG) ----
 app.get("/debug/screenshot", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -356,7 +357,6 @@ app.get("/debug/screenshot", async (req, res) => {
   }
 });
 
-// ---- debug: persist screenshot to /tmp/salonbiz.png ----
 app.get("/debug/salonbiz", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -391,7 +391,6 @@ app.get("/debug/salonbiz.png", (req, res) => {
   return res.sendFile("/tmp/salonbiz.png");
 });
 
-// ---- debug: login before/after screenshots ----
 app.get("/debug/login", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
