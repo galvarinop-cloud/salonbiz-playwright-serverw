@@ -134,26 +134,44 @@ app.get("/health", async (req, res) => {
  * Availability tool endpoint for:
  * Amare-Hair-salon-Check-Availability
  */
+
 app.post("/availability", (req, res) => {
+  console.log("[REQ] POST /availability");
   console.log("AVAILABILITY WEBHOOK BODY:", JSON.stringify(req.body));
 
-  const toolCallId = extractToolCallId(req);
-  const args = extractArgs(req);
+  const toolCall =
+    req.body?.message?.toolCallList?.[0] ||
+    req.body?.message?.toolCalls?.[0] ||
+    null;
 
-  const bookingDateAndTime =
-    args.bookingDateAndTime || req.body?.bookingDateAndTime || null;
+  const toolCallId = toolCall?.id;
 
-  if (!bookingDateAndTime) {
-    return vapiError(res, toolCallId, "bookingDateAndTime required");
+  let args = toolCall?.function?.arguments;
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args);
+    } catch {
+      args = {};
+    }
   }
 
-  return vapiRespond(res, toolCallId, {
-    ok: true,
-    available: true,
-    bookingDateAndTime
+  const bookingDateAndTime = args?.bookingDateAndTime;
+
+  console.log("AVAILABILITY responding toolCallId:", toolCallId);
+
+  return res.status(200).json({
+    results: [
+      {
+        toolCallId,
+        result: {
+          ok: true,
+          available: true,
+          bookingDateAndTime
+        }
+      }
+    ]
   });
 });
-
 /**
  * Booking endpoint for salonbiz_book_appointment
  * Expects args:
