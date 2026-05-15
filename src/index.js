@@ -100,6 +100,49 @@ async function loginIfNeeded(page) {
   await page.waitForTimeout(4000);
 }
 
+/**
+ * Opens the appointment create panel by clicking a real scheduler grid column.
+ * This is much more reliable than hard-coded coordinates.
+ */
+async function openCreatePanelByClickingGrid(page) {
+  const cell = page
+    .locator("#dhtmlxScheduler .dhx_cal_data .dhx_scale_holder_now")
+    .first();
+
+  await cell.waitFor({ state: "visible", timeout: 15000 });
+
+  const box = await cell.boundingBox();
+  if (!box) throw new Error("Scheduler cell bounding box not found");
+
+  // Click somewhere safely inside the column, away from headers/edges
+  await page.mouse.click(
+    box.x + box.width / 2,
+    box.y + Math.min(120, Math.max(40, box.height / 3))
+  );
+
+  await page.waitForTimeout(1500);
+}
+
+/**
+ * Ensures the create panel is open by:
+ * 1) checking if service input is visible
+ * 2) if not, clicking scheduler grid to open it
+ */
+async function ensureCreatePanelOpen(page) {
+  const serviceInput = page
+    .locator("sbiz-book-right-panel")
+    .locator('input[formcontrolname="service"]')
+    .first();
+
+  const visibleNow = await serviceInput.isVisible().catch(() => false);
+  if (!visibleNow) {
+    await openCreatePanelByClickingGrid(page);
+  }
+
+  await serviceInput.waitFor({ state: "visible", timeout: 15000 });
+  return serviceInput;
+}
+
 // ---- Vapi tool-call helpers ----
 function extractToolCall(req) {
   return (
@@ -348,7 +391,7 @@ app.get("/debug/screenshot", async (req, res) => {
   }
 });
 
-// ---- debug: click a calendar slot and screenshot before/after ----
+// ---- debug: click a scheduler grid cell and screenshot before/after ----
 app.get("/debug/click_slot", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -357,12 +400,15 @@ app.get("/debug/click_slot", async (req, res) => {
 
   const { context, page } = await getPage(browser);
 
+  let step = "start";
   try {
     if (cookiesExpired()) cookieState = null;
 
+    step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
 
+    step = "goto appointmentbook";
     await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
       waitUntil: "domcontentloaded"
     });
@@ -370,9 +416,9 @@ app.get("/debug/click_slot", async (req, res) => {
     await page.waitForTimeout(2500);
     await page.screenshot({ path: "/tmp/slot_before.png", fullPage: true });
 
-    await page.mouse.click(500, 300);
+    step = "click real scheduler column";
+    await openCreatePanelByClickingGrid(page);
 
-    await page.waitForTimeout(1500);
     await page.screenshot({ path: "/tmp/slot_after.png", fullPage: true });
 
     return res.status(200).json({
@@ -381,8 +427,8 @@ app.get("/debug/click_slot", async (req, res) => {
         "Saved /tmp/slot_before.png and /tmp/slot_after.png. Open /debug/slot_before.png and /debug/slot_after.png"
     });
   } catch (e) {
-    console.error("DEBUG /debug/click_slot error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    console.error("DEBUG /debug/click_slot error at step:", step, e);
+    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
@@ -397,7 +443,7 @@ app.get("/debug/slot_after.png", (req, res) => {
   return res.sendFile("/tmp/slot_after.png");
 });
 
-// ---- debug: open Create + dump right panel snippet (no Create click; just waits) ----
+// ---- debug: open Create + dump right panel snippet ----
 app.get("/debug/create_dom", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -420,19 +466,8 @@ app.get("/debug/create_dom", async (req, res) => {
     });
     await page.waitForTimeout(2500);
 
-    step = "wait for service input (fallback click slot)";
-    const serviceInput = page
-      .locator("sbiz-book-right-panel")
-      .locator('input[formcontrolname="service"]')
-      .first();
-
-    const visibleNow = await serviceInput.isVisible().catch(() => false);
-    if (!visibleNow) {
-      await page.mouse.click(500, 300);
-      await page.waitForTimeout(1200);
-    }
-
-    await serviceInput.waitFor({ state: "visible", timeout: 15000 });
+    step = "ensure create panel open";
+    await ensureCreatePanelOpen(page);
 
     step = "screenshot";
     await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
@@ -461,7 +496,7 @@ app.get("/debug/create_form.png", (req, res) => {
   return res.sendFile("/tmp/create_form.png");
 });
 
-// ---- debug: fill the Service field using typeahead (no Create click; just waits) ----
+// ---- debug: fill the Service field using typeahead ----
 app.get("/debug/fill_service", async (req, res) => {
   const service = String(req.query.service || "Shape Me Haircut");
 
@@ -486,20 +521,8 @@ app.get("/debug/fill_service", async (req, res) => {
     });
     await page.waitForTimeout(2500);
 
-    const serviceInput = page
-      .locator("sbiz-book-right-panel")
-      .locator('input[formcontrolname="service"]')
-      .first();
-
-    step = "ensure panel open (fallback click slot if needed)";
-    const visibleNow = await serviceInput.isVisible().catch(() => false);
-    if (!visibleNow) {
-      await page.mouse.click(500, 300);
-      await page.waitForTimeout(1200);
-    }
-
-    step = "wait for service input";
-    await serviceInput.waitFor({ state: "visible", timeout: 15000 });
+    step = "ensure create panel open";
+    const serviceInput = await ensureCreatePanelOpen(page);
 
     step = "type service";
     await serviceInput.click();
@@ -520,10 +543,13 @@ app.get("/debug/fill_service", async (req, res) => {
     return res.status(200).send(buf);
   } catch (e) {
     console.error("DEBUG /debug/fill_service error at step:", step, e);
+    // Helpful extra artifact:
+    await page.screenshot({ path: "/tmp/fill_service_error.png", fullPage: true }).catch(() => {});
     return res.status(500).json({
       ok: false,
       step,
-      error: e?.message || String(e)
+      error: e?.message || String(e),
+      debugScreenshot: "/tmp/fill_service_error.png"
     });
   } finally {
     await context.close().catch(() => {});
