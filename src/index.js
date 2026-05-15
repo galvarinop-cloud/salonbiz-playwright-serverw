@@ -226,8 +226,12 @@ app.post("/book", async (req, res) => {
     await saveCookies(context);
 
     // TODO: implement real booking selectors
-    return vapiRespond(res, toolCallId, {
-      ok: true,
+      return vapiRespond(res, toolCallId, {
+  ok: false,
+  status: "not_implemented",
+  message:
+    "Booking automation not implemented yet. The system logged in, but could not complete the booking."
+});
       status: "received",
       message:
         "Logged in successfully. Booking automation not implemented yet (selectors needed).",
