@@ -45,38 +45,55 @@ async function saveCookies(context) {
   cookieStateSetAt = Date.now();
 }
 
+/**
+ * More robust login that works across slightly different SalonBiz login pages.
+ * If already logged in, it returns quickly.
+ */
 async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
 
-  // Navigate to a page that forces auth in the backoffice
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-  waitUntil: "domcontentloaded"
+    waitUntil: "domcontentloaded"
   });
 
-  // If password input exists, we need to log in
-  const hasLogin = (await page.locator('input[type="password"]').count()) > 0;
-  if (!hasLogin) return;
+  // Let any SPA/login widgets finish loading
+  await page.waitForTimeout(1500);
 
-  const userInput = page
-    .locator('input[type="text"], input[type="email"]')
+  // If password input doesn't exist, assume we're already logged in
+  const passwordCount = await page.locator('input[type="password"]').count();
+  if (passwordCount === 0) return;
+
+  // Try common username/email field patterns
+  const emailOrUser = page
+    .locator(
+      'input[type="email"], input[name*="user" i], input[name*="email" i], input[placeholder*="email" i], input[placeholder*="user" i], input[type="text"]'
+    )
     .first();
+
   const passInput = page.locator('input[type="password"]').first();
 
-  await userInput.fill(SALONBIZ_USERNAME);
+  await emailOrUser.click({ timeout: 5000 }).catch(() => {});
+  await emailOrUser.fill(SALONBIZ_USERNAME);
+
+  await passInput.click({ timeout: 5000 }).catch(() => {});
   await passInput.fill(SALONBIZ_PASSWORD);
 
-  const loginButton = page
-    .getByRole("button", { name: /log in|login|sign in/i })
+  // Click the first visible "login" style button, else submit via Enter
+  const loginBtn = page
+    .locator(
+      'button:has-text("Log in"), button:has-text("Login"), button:has-text("Sign in"), input[type="submit"]'
+    )
     .first();
 
-  if ((await loginButton.count()) > 0) {
-    await loginButton.click();
+  if ((await loginBtn.count()) > 0) {
+    await loginBtn.click({ timeout: 5000 });
   } else {
     await page.keyboard.press("Enter");
   }
 
-  await page.waitForLoadState("domcontentloaded");
+  // Give time for redirect/app load
+  await page.waitForTimeout(3000);
 }
 
 // ---- Vapi tool-call helpers ----
@@ -154,8 +171,7 @@ app.post("/availability", (req, res) => {
 
   const bookingDateAndTime = args?.bookingDateAndTime;
 
-  // TODO: Replace with real Google Calendar / SalonBiz availability logic.
-  // For now, always return available=true.
+  // TODO: Replace with real availability logic.
   return vapiRespond(res, toolCallId, {
     ok: true,
     available: true,
@@ -214,7 +230,7 @@ app.post("/book", async (req, res) => {
       ok: false,
       status: "not_implemented",
       message:
-        "Booking automation not implemented yet. The system logged in, but could not complete the booking.",
+        "Booking automation not implemented yet. The system attempted login, but could not complete the booking.",
       mapped: {
         client: { firstName, lastName, phone: customerPhone || "" },
         serviceName: service,
@@ -277,7 +293,7 @@ app.post("/cancel", async (req, res) => {
       ok: false,
       status: "not_implemented",
       message:
-        "Cancel automation not implemented yet. The system logged in, but could not complete the cancellation.",
+        "Cancel automation not implemented yet. The system attempted login, but could not complete the cancellation.",
       mapped: {
         customerName,
         customerPhone: customerPhone || null,
@@ -310,7 +326,7 @@ app.get("/debug/screenshot", async (req, res) => {
     await saveCookies(context);
 
     await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "networkidle"
+      waitUntil: "domcontentloaded"
     });
 
     const buf = await page.screenshot({ fullPage: true });
@@ -359,6 +375,8 @@ app.get("/debug/salonbiz", async (req, res) => {
 app.get("/debug/salonbiz.png", (req, res) => {
   return res.sendFile("/tmp/salonbiz.png");
 });
+
+// ---- Debug: login before/after screenshots ----
 app.get("/debug/login", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -368,18 +386,15 @@ app.get("/debug/login", async (req, res) => {
   const { context, page } = await getPage(browser);
 
   try {
-    // Go to appointment book (forces auth page)
     await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
       waitUntil: "domcontentloaded"
     });
 
-    // Screenshot BEFORE filling
+    await page.waitForTimeout(1500);
     await page.screenshot({ path: "/tmp/login_before.png", fullPage: true });
 
-    // Try login
     await loginIfNeeded(page);
 
-    // Wait a bit and screenshot AFTER login attempt
     await page.waitForTimeout(2000);
     await page.screenshot({ path: "/tmp/login_after.png", fullPage: true });
 
@@ -404,6 +419,7 @@ app.get("/debug/login_before.png", (req, res) => {
 app.get("/debug/login_after.png", (req, res) => {
   return res.sendFile("/tmp/login_after.png");
 });
+
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
 });
