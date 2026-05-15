@@ -229,7 +229,7 @@ app.post("/book", async (req, res) => {
       ok: false,
       status: "not_implemented",
       message:
-        "Booking automation not implemented yet. Login should now work; next step is implementing booking selectors.",
+        "Booking automation not implemented yet. Login works; next step is calendar interaction + booking selectors.",
       mapped: {
         client: { firstName, lastName, phone: customerPhone || "" },
         serviceName: service,
@@ -295,7 +295,7 @@ app.post("/cancel", async (req, res) => {
       ok: false,
       status: "not_implemented",
       message:
-        "Cancel automation not implemented yet. Login should now work; next step is implementing cancel selectors.",
+        "Cancel automation not implemented yet. Login works; next step is finding the appointment and cancel flow selectors.",
       mapped: {
         customerName,
         customerPhone: customerPhone || null,
@@ -456,6 +456,56 @@ app.get("/debug/login_dom", async (req, res) => {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
+});
+
+// ---- debug: click a calendar slot and screenshot before/after ----
+app.get("/debug/click_slot", async (req, res) => {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const { context, page } = await getPage(browser);
+
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
+
+    await page.waitForTimeout(2500);
+    await page.screenshot({ path: "/tmp/slot_before.png", fullPage: true });
+
+    // Click somewhere in the calendar grid area (we'll tune this after we see what opens)
+    await page.mouse.click(750, 420);
+
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: "/tmp/slot_after.png", fullPage: true });
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        "Saved /tmp/slot_before.png and /tmp/slot_after.png. Open /debug/slot_before.png and /debug/slot_after.png"
+    });
+  } catch (e) {
+    console.error("DEBUG /debug/click_slot error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/slot_before.png", (req, res) => {
+  return res.sendFile("/tmp/slot_before.png");
+});
+
+app.get("/debug/slot_after.png", (req, res) => {
+  return res.sendFile("/tmp/slot_after.png");
 });
 
 app.listen(PORT, () => {
