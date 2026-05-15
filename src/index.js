@@ -16,6 +16,10 @@ const SALONBIZ_BASE_URL =
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
 const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 
+// Click tuning via env vars (already working for you)
+const CREATE_CLICK_X_PCT = Number(process.env.CREATE_CLICK_X_PCT || 0.95);
+const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
+
 let cookieState = null;
 let cookieStateSetAt = 0;
 const COOKIE_TTL_MS = Number(process.env.COOKIE_TTL_MS || 1000 * 60 * 60 * 6);
@@ -43,9 +47,6 @@ async function saveCookies(context) {
   cookieStateSetAt = Date.now();
 }
 
-/**
- * SalonBiz login (Angular-friendly).
- */
 async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
@@ -60,7 +61,6 @@ async function loginIfNeeded(page) {
   const passSel = 'input[formcontrolname="password"]';
   const submitSel = 'button[type="submit"]';
 
-  // If already logged in, password field won't exist
   if ((await page.locator(passSel).count()) === 0) return;
 
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
@@ -97,33 +97,15 @@ async function loginIfNeeded(page) {
   await page.waitForTimeout(4000);
 }
 
-/**
- * Click the top-right pink "Create" button by coordinate (relative to viewport).
- * We click in the header area near the right side, slightly below the top edge.
- *
- * Tune via env vars if needed:
- * - CREATE_CLICK_X_PCT (default 0.90)
- * - CREATE_CLICK_Y_PCT (default 0.085)
- */
 async function clickPinkCreateButton(page) {
   const vp = page.viewportSize() || { width: 1280, height: 720 };
-
-  const xPct = Number(process.env.CREATE_CLICK_X_PCT || 0.9);
-  const yPct = Number(process.env.CREATE_CLICK_Y_PCT || 0.085);
-
-  const x = Math.floor(vp.width * xPct);
-  const y = Math.floor(vp.height * yPct);
-
+  const x = Math.floor(vp.width * CREATE_CLICK_X_PCT);
+  const y = Math.floor(vp.height * CREATE_CLICK_Y_PCT);
   await page.mouse.click(x, y);
-  await page.waitForTimeout(1500);
-
-  return { x, y, vp, xPct, yPct };
+  await page.waitForTimeout(1200);
+  return { x, y, vp, xPct: CREATE_CLICK_X_PCT, yPct: CREATE_CLICK_Y_PCT };
 }
 
-/**
- * Ensure appointment create panel is open by clicking pink Create,
- * then waiting for Service input.
- */
 async function ensureCreatePanelOpen(page) {
   const serviceInput = page
     .locator("sbiz-book-right-panel")
@@ -134,9 +116,88 @@ async function ensureCreatePanelOpen(page) {
   if (visibleNow) return serviceInput;
 
   await clickPinkCreateButton(page);
-
   await serviceInput.waitFor({ state: "visible", timeout: 20000 });
   return serviceInput;
+}
+
+async function typeaheadSelect(inputLocator, value) {
+  await inputLocator.click({ timeout: 15000 });
+  await inputLocator.fill("");
+  await inputLocator.type(String(value), { delay: 35 });
+  await inputLocator.page().waitForTimeout(600);
+  await inputLocator.page().keyboard.press("ArrowDown");
+  await inputLocator.page().keyboard.press("Enter");
+}
+
+async function setTextInput(inputLocator, value) {
+  await inputLocator.click({ timeout: 15000 });
+  await inputLocator.fill(String(value));
+}
+
+async function clickRightPanelCreate(page) {
+  // The final submit button is a pink "Create" button on the right panel.
+  // Try several robust selectors.
+  const candidates = [
+    page
+      .locator("sbiz-book-right-panel")
+      .locator('button:has-text("Create")'),
+    page
+      .locator("sbiz-book-right-panel")
+      .locator('button:has-text("CREATE")'),
+    page
+      .locator("sbiz-book-right-panel")
+      .locator('button.sb-edit-appointment__create-button'),
+    page
+      .locator("sbiz-book-right-panel")
+      .locator('button[class*="create"]'),
+    page
+      .locator("sbiz-book-right-panel")
+      .locator('button[type="submit"]')
+  ];
+
+  for (const loc of candidates) {
+    if ((await loc.count().catch(() => 0)) > 0) {
+      const btn = loc.first();
+      if (await btn.isVisible().catch(() => false)) {
+        await btn.click({ timeout: 15000 });
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// ---- Vapi webhook helpers ----
+function extractToolCall(req) {
+  return (
+    req.body?.message?.toolCallList?.[0] ||
+    req.body?.message?.toolCalls?.[0] ||
+    null
+  );
+}
+function extractToolCallId(req) {
+  const toolCall = extractToolCall(req);
+  return toolCall?.id || null;
+}
+function extractArgs(req) {
+  const toolCall = extractToolCall(req);
+  const raw = toolCall?.function?.arguments;
+
+  if (raw && typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+function vapiRespond(res, toolCallId, result, statusCode = 200) {
+  return res.status(statusCode).json({ results: [{ toolCallId, result }] });
+}
+function vapiError(res, toolCallId, message, statusCode = 400) {
+  return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
 // ---- health ----
@@ -144,7 +205,154 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
-// ---- debug: click pink create + before/after screenshots ----
+// ---- availability (stub) ----
+app.post("/availability", (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
+  return vapiRespond(res, toolCallId, {
+    ok: true,
+    available: true,
+    bookingDateAndTime: args?.bookingDateAndTime || null
+  });
+});
+
+// ---- book (now actually fills fields + clicks create) ----
+app.post("/book", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
+
+  const {
+    customerName,
+    customerPhone,
+    service,
+    stylist,
+    date, // YYYY-MM-DD
+    time, // HH:MM (24h)
+    notes
+  } = args;
+
+  if (!customerName) return vapiError(res, toolCallId, "customerName required");
+  if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
+  if (!service) return vapiError(res, toolCallId, "service required");
+  if (!date) return vapiError(res, toolCallId, "date required");
+  if (!time) return vapiError(res, toolCallId, "time required");
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+  const { context, page } = await getPage(browser);
+
+  let step = "start";
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    step = "login";
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    step = "goto appointmentbook";
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
+    await page.waitForTimeout(2500);
+
+    step = "open create panel";
+    await ensureCreatePanelOpen(page);
+
+    const panel = page.locator("sbiz-book-right-panel");
+
+    step = "client name";
+    // These selectors might vary; adjust after we confirm actual formcontrolname values.
+    // We try common patterns.
+    const firstNameInput = panel.locator('input[formcontrolname="firstName"]').first();
+    const lastNameInput = panel.locator('input[formcontrolname="lastName"]').first();
+    const phoneInput = panel.locator('input[formcontrolname="phone"]').first();
+
+    const parts = String(customerName).trim().split(/\s+/).filter(Boolean);
+    const first = parts[0] || "";
+    const last = parts.slice(1).join(" ") || "";
+
+    if (await firstNameInput.count()) await setTextInput(firstNameInput, first);
+    if (await lastNameInput.count()) await setTextInput(lastNameInput, last);
+    if (await phoneInput.count()) await setTextInput(phoneInput, customerPhone);
+
+    step = "service";
+    const serviceInput = panel.locator('input[formcontrolname="service"]').first();
+    await serviceInput.waitFor({ state: "visible", timeout: 15000 });
+    await typeaheadSelect(serviceInput, service);
+
+    step = "stylist (optional)";
+    if (stylist) {
+      const staffInput = panel
+        .locator('input[formcontrolname="staff"], input[formcontrolname="stylist"]')
+        .first();
+      if ((await staffInput.count().catch(() => 0)) > 0) {
+        await typeaheadSelect(staffInput, stylist);
+      }
+    }
+
+    step = "start date/time";
+    // Common control names; adjust once we confirm.
+    const dateInput = panel.locator('input[formcontrolname="date"], input[formcontrolname="startDate"]').first();
+    const timeInput = panel.locator('input[formcontrolname="time"], input[formcontrolname="startTime"]').first();
+
+    if ((await dateInput.count().catch(() => 0)) > 0) await setTextInput(dateInput, date);
+    if ((await timeInput.count().catch(() => 0)) > 0) await setTextInput(timeInput, time);
+
+    step = "notes (optional)";
+    if (notes) {
+      const notesInput = panel.locator('textarea[formcontrolname="notes"], textarea').first();
+      if ((await notesInput.count().catch(() => 0)) > 0) {
+        await setTextInput(notesInput, notes);
+      }
+    }
+
+    step = "click final create";
+    const clicked = await clickRightPanelCreate(page);
+    if (!clicked) {
+      await page.screenshot({ path: "/tmp/book_error.png", fullPage: true }).catch(() => {});
+      throw new Error('Could not find/click the right-panel final "Create" button');
+    }
+
+    step = "done screenshot";
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: "/tmp/book_after.png", fullPage: true }).catch(() => {});
+
+    return vapiRespond(res, toolCallId, {
+      ok: true,
+      step,
+      message: "Attempted to create appointment. Verify in SalonBiz.",
+      debug: {
+        screenshots: ["/tmp/book_after.png"]
+      }
+    });
+  } catch (e) {
+    console.error("BOOK error at step:", step, e);
+    await page.screenshot({ path: "/tmp/book_error.png", fullPage: true }).catch(() => {});
+    return vapiRespond(
+      res,
+      toolCallId,
+      { ok: false, step, error: e?.message || String(e) },
+      500
+    );
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+// ---- cancel (still stub) ----
+app.post("/cancel", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  return vapiRespond(res, toolCallId, {
+    ok: false,
+    status: "not_implemented",
+    message: "Cancel not implemented yet."
+  });
+});
+
+// ---- debug: click create + before/after screenshots ----
 app.get("/debug/click_create", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -173,7 +381,7 @@ app.get("/debug/click_create", async (req, res) => {
     step = "click pink create";
     const click = await clickPinkCreateButton(page);
 
-    step = "verify service input visible";
+    step = "verify service visible";
     const serviceVisible = await page
       .locator("sbiz-book-right-panel")
       .locator('input[formcontrolname="service"]')
@@ -184,15 +392,9 @@ app.get("/debug/click_create", async (req, res) => {
     step = "screenshot after";
     await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
 
-    return res.status(200).json({
-      ok: true,
-      click,
-      serviceVisible,
-      message:
-        "Open /debug/create_before.png and /debug/create_after.png to confirm it clicked the pink Create button."
-    });
+    return res.status(200).json({ ok: true, click, serviceVisible });
   } catch (e) {
-    console.error("DEBUG /debug/click_create error at step:", step, e);
+    console.error("DEBUG click_create error at step:", step, e);
     await page.screenshot({ path: "/tmp/create_error.png", fullPage: true }).catch(() => {});
     return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
   } finally {
@@ -204,64 +406,6 @@ app.get("/debug/click_create", async (req, res) => {
 app.get("/debug/create_before.png", (req, res) => res.sendFile("/tmp/create_before.png"));
 app.get("/debug/create_after.png", (req, res) => res.sendFile("/tmp/create_after.png"));
 app.get("/debug/create_error.png", (req, res) => res.sendFile("/tmp/create_error.png"));
-
-// ---- debug: fill service (clicks pink create first) ----
-app.get("/debug/fill_service", async (req, res) => {
-  const service = String(req.query.service || "Shape Me Haircut");
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-  let step = "start";
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    step = "login";
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    step = "goto appointmentbook";
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
-    await page.waitForTimeout(2500);
-
-    step = "ensure create panel open";
-    const serviceInput = await ensureCreatePanelOpen(page);
-
-    step = "type service";
-    await serviceInput.click();
-    await page.keyboard.down("Control");
-    await page.keyboard.press("KeyA");
-    await page.keyboard.up("Control");
-    await page.keyboard.type(service, { delay: 40 });
-
-    step = "select suggestion";
-    await page.waitForTimeout(800);
-    await page.keyboard.press("ArrowDown");
-    await page.keyboard.press("Enter");
-
-    step = "screenshot";
-    const buf = await page.screenshot({ fullPage: true });
-    res.setHeader("Content-Type", "image/png");
-    return res.status(200).send(buf);
-  } catch (e) {
-    console.error("DEBUG /debug/fill_service error at step:", step, e);
-    await page.screenshot({ path: "/tmp/fill_service_error.png", fullPage: true }).catch(() => {});
-    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/fill_service_error.png", (req, res) =>
-  res.sendFile("/tmp/fill_service_error.png")
-);
 
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
