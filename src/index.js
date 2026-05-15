@@ -195,16 +195,15 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
   await setTextInput(modal.locator('input[formcontrolname="lastName"]').first(), lastName);
   await setTextInput(modal.locator('input[formcontrolname="telMobile"]').first(), phoneFormatted);
 
-  if (customerEmail) {
-    await setTextInput(modal.locator('input[formcontrolname="email"]').first(), customerEmail);
-  }
+  // Required (per your decision)
+  await setTextInput(modal.locator('input[formcontrolname="email"]').first(), customerEmail);
 
   await modal
     .locator('button[type="submit"]:has-text("Create")')
     .first()
     .click({ timeout: 15000 });
 
-  // If it doesn't close, capture the footer alert
+  // Give UI time to validate/close
   await page.waitForTimeout(1500);
 
   const stillVisible = await modal.isVisible().catch(() => false);
@@ -364,6 +363,8 @@ app.post("/book", async (req, res) => {
     return vapiError(res, toolCallId, "isNewClient required (true/false boolean)");
   if (!customerName) return vapiError(res, toolCallId, "customerName required");
   if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
+  if (isNewClient && !customerEmail)
+    return vapiError(res, toolCallId, "customerEmail required when isNewClient=true");
   if (!service) return vapiError(res, toolCallId, "service required");
   if (!startTime) return vapiError(res, toolCallId, "startTime required (ex: 2:30 PM)");
   if (!customDuration) return vapiError(res, toolCallId, "customDuration required (ex: 60)");
@@ -442,101 +443,21 @@ app.get("/debug/new_client_submit_failed.png", (req, res) =>
   res.sendFile("/tmp/new_client_submit_failed.png")
 );
 
-// ---- cancel (stub) ----
-app.post("/cancel", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  return vapiRespond(res, toolCallId, {
-    ok: false,
-    status: "not_implemented",
-    message: "Cancel not implemented yet."
-  });
-});
-
-// ---- debug runner (existing client) ----
-app.get("/debug/run_book_existing", async (req, res) => {
-  const customerName = String(req.query.name || "");
-  const customerPhone = String(req.query.phone || "");
-  const service = String(req.query.service || "");
-  const startTime = String(req.query.time || "");
-  const customDuration = String(req.query.length || "");
-  const stylist = req.query.stylist ? String(req.query.stylist) : undefined;
-  const requestReason = req.query.requestReason ? String(req.query.requestReason) : undefined;
-
-  if (!customerName || !customerPhone || !service || !startTime || !customDuration) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing required query params: name, phone, service, time, length"
-    });
-  }
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-  const { context, page } = await getPage(browser);
-
-  let step = "start";
-  try {
-    step = "login";
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    step = "runBooking";
-    const result = await runBooking(page, {
-      isNewClient: false,
-      customerName,
-      customerPhone,
-      service,
-      stylist,
-      startTime,
-      customDuration,
-      requestReason
-    });
-
-    await page.screenshot({ path: "/tmp/debug_run_existing.png", fullPage: true }).catch(() => {});
-
-    return res.status(200).json({
-      ok: true,
-      step,
-      result,
-      screenshot: "/debug/debug_run_existing.png"
-    });
-  } catch (e) {
-    await page.screenshot({ path: "/tmp/debug_run_existing_error.png", fullPage: true }).catch(() => {});
-    return res.status(500).json({
-      ok: false,
-      step,
-      error: e?.message || String(e),
-      screenshot: "/debug/debug_run_existing_error.png"
-    });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/debug_run_existing.png", (req, res) =>
-  res.sendFile("/tmp/debug_run_existing.png")
-);
-app.get("/debug/debug_run_existing_error.png", (req, res) =>
-  res.sendFile("/tmp/debug_run_existing_error.png")
-);
-
 // ---- debug runner (new client) ----
 app.get("/debug/run_book_new", async (req, res) => {
   const customerName = String(req.query.name || "");
   const customerPhone = String(req.query.phone || "");
-  const customerEmail = req.query.email ? String(req.query.email) : undefined;
+  const customerEmail = String(req.query.email || "");
   const service = String(req.query.service || "");
   const startTime = String(req.query.time || "");
   const customDuration = String(req.query.length || "");
   const stylist = req.query.stylist ? String(req.query.stylist) : undefined;
   const requestReason = req.query.requestReason ? String(req.query.requestReason) : undefined;
 
-  if (!customerName || !customerPhone || !service || !startTime || !customDuration) {
+  if (!customerName || !customerPhone || !customerEmail || !service || !startTime || !customDuration) {
     return res.status(400).json({
       ok: false,
-      error: "Missing required query params: name, phone, service, time, length"
+      error: "Missing required query params: name, phone, email, service, time, length"
     });
   }
 
@@ -546,13 +467,10 @@ app.get("/debug/run_book_new", async (req, res) => {
   });
   const { context, page } = await getPage(browser);
 
-  let step = "start";
   try {
-    step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    step = "runBooking";
     const result = await runBooking(page, {
       isNewClient: true,
       customerName,
@@ -569,7 +487,6 @@ app.get("/debug/run_book_new", async (req, res) => {
 
     return res.status(200).json({
       ok: true,
-      step,
       result,
       screenshot: "/debug/debug_run_new.png"
     });
@@ -577,7 +494,6 @@ app.get("/debug/run_book_new", async (req, res) => {
     await page.screenshot({ path: "/tmp/debug_run_new_error.png", fullPage: true }).catch(() => {});
     return res.status(500).json({
       ok: false,
-      step,
       error: e?.message || String(e),
       screenshot: "/debug/debug_run_new_error.png"
     });
