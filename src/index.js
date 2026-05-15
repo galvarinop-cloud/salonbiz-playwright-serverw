@@ -19,21 +19,23 @@ function requiredEnv(name, value) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
 }
 
+function cookiesExpired() {
+  return !cookieState || Date.now() - cookieStateSetAt > COOKIE_TTL_MS;
+}
+
 async function getPage(browser) {
   const context = await browser.newContext(
     cookieState ? { storageState: cookieState } : undefined
   );
   const page = await context.newPage();
+  page.setDefaultTimeout(30000);
+  page.setDefaultNavigationTimeout(30000);
   return { context, page };
 }
 
 async function saveCookies(context) {
   cookieState = await context.storageState();
   cookieStateSetAt = Date.now();
-}
-
-function cookiesExpired() {
-  return !cookieState || Date.now() - cookieStateSetAt > COOKIE_TTL_MS;
 }
 
 async function loginIfNeeded(page) {
@@ -68,21 +70,77 @@ async function loginIfNeeded(page) {
   await page.waitForLoadState("domcontentloaded");
 }
 
+/**
+ * Vapi Function tool webhooks must respond with:
+ * { results: [{ toolCallId, result }] }
+ */
+function getToolCallInfo(req) {
+  const toolCall =
+    req.body?.message?.toolCallList?.[0] ||
+    req.body?.message?.toolCalls?.[0] ||
+    null;
+
+  const toolCallId = toolCall?.id || null;
+
+  let args = {};
+  try {
+    const rawArgs = toolCall?.function?.arguments;
+    args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs || {};
+  } catch {
+    args = {};
+  }
+
+  return { toolCallId, args };
+}
+
+function vapiResult(res, toolCallId, result, statusCode = 200) {
+  return res.status(statusCode).json({
+    results: [
+      {
+        toolCallId,
+        result
+      }
+    ]
+  });
+}
+
+function vapiError(res, toolCallId, message, statusCode = 400) {
+  return vapiResult(res, toolCallId, { ok: false, error: message }, statusCode);
+}
+
 app.get("/health", async (req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
+/**
+ * Availability tool: Amare-Hair-salon-Check-Availability
+ * Expects args: { bookingDateAndTime: "YYYY-MM-DDTHH:mm:ss" }
+ */
 app.post("/availability", (req, res) => {
-  const { bookingDateAndTime } = req.body || {};
-  return res.json({
+  const { toolCallId, args } = getToolCallInfo(req);
+
+  const bookingDateAndTime =
+    args.bookingDateAndTime || req.body?.bookingDateAndTime;
+
+  if (!bookingDateAndTime) {
+    return vapiError(res, toolCallId, "bookingDateAndTime required");
+  }
+
+  // For now, always return available
+  return vapiResult(res, toolCallId, {
     ok: true,
     available: true,
     bookingDateAndTime
   });
 });
 
+/**
+ * Booking tool: salonbiz_book_appointment
+ * Expects Vapi args:
+ * { customerName, customerPhone, service, stylist, date, time, timezone, notes?, email? }
+ */
 app.post("/book", async (req, res) => {
-  const body = req.body || {};
+  const { toolCallId, args } = getToolCallInfo(req);
 
   const {
     customerName,
@@ -94,51 +152,33 @@ app.post("/book", async (req, res) => {
     timezone,
     notes,
     email
-  } = body;
+  } = args;
 
-  let { client, serviceName, staffName, startIso } = body;
+  if (!customerName) return vapiError(res, toolCallId, "customerName required");
+  if (!service) return vapiError(res, toolCallId, "service required");
+  if (!date) return vapiError(res, toolCallId, "date required");
+  if (!time) return vapiError(res, toolCallId, "time required");
+  if (!timezone) return vapiError(res, toolCallId, "timezone required");
 
-  if (customerName || service || stylist || date || time || timezone) {
-    const parts = String(customerName || "")
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean);
+  const parts = String(customerName).trim().split(/\s+/).filter(Boolean);
+  const firstName = parts[0] || "";
+  const lastName = parts.slice(1).join(" ") || "";
 
-    const firstName = parts[0] || "Unknown";
-    const lastName = parts.slice(1).join(" ") || "Unknown";
-
-    client = {
-      firstName,
-      lastName,
-      phone: customerPhone || ""
-    };
-
-    serviceName = service;
-    staffName = stylist || "Any";
-    startIso = `${date}T${time}`;
+  if (!firstName || !lastName) {
+    return vapiError(
+      res,
+      toolCallId,
+      "customerName must include first and last name"
+    );
   }
 
-  if (!client?.firstName || !client?.lastName) {
-    return res.status(400).json({
-      error: "customerName required (or client.firstName/client.lastName)"
-    });
-  }
-  if (!serviceName)
-    return res.status(400).json({ error: "service required (or serviceName)" });
-  if (!staffName)
-    return res.status(400).json({ error: "stylist required (or staffName)" });
-  if (!startIso)
-    return res.status(400).json({ error: "date/time required (or startIso)" });
-  if (!timezone) {
-    return res
-      .status(400)
-      .json({ error: "timezone required (e.g., America/New_York)" });
-  }
+  const startIso = `${date}T${time}`;
 
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
+
   const { context, page } = await getPage(browser);
 
   try {
@@ -147,30 +187,69 @@ app.post("/book", async (req, res) => {
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    return res.json({
+    // TODO: implement real booking selectors.
+    // For now, return a successful-shaped response so the assistant flow works.
+    return vapiResult(res, toolCallId, {
       ok: true,
+      status: "received",
       message:
         "Logged in successfully. Booking automation not implemented yet (selectors needed).",
-      mapped: { client, serviceName, staffName, startIso, notes, email, timezone }
+      mapped: {
+        client: { firstName, lastName, phone: customerPhone || "" },
+        serviceName: service,
+        staffName: stylist || "Any",
+        startIso,
+        timezone,
+        notes: notes || null,
+        email: email || null
+      }
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return vapiResult(
+      res,
+      toolCallId,
+      { ok: false, error: e?.message || String(e) },
+      500
+    );
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
 });
 
+/**
+ * Cancel tool: salonbiz_cancel_appointment
+ * Expects Vapi args:
+ * { customerName, customerPhone?, date, time, timezone, notes?, confirmationRequired }
+ */
 app.post("/cancel", async (req, res) => {
-  const { clientName, staffName, startIso } = req.body || {};
-  if (!clientName) return res.status(400).json({ error: "clientName required" });
-  if (!staffName) return res.status(400).json({ error: "staffName required" });
-  if (!startIso) return res.status(400).json({ error: "startIso required" });
+  const { toolCallId, args } = getToolCallInfo(req);
+
+  const {
+    customerName,
+    customerPhone,
+    date,
+    time,
+    timezone,
+    notes,
+    confirmationRequired
+  } = args;
+
+  if (!confirmationRequired) {
+    return vapiError(res, toolCallId, "confirmationRequired must be true");
+  }
+  if (!customerName) return vapiError(res, toolCallId, "customerName required");
+  if (!date) return vapiError(res, toolCallId, "date required");
+  if (!time) return vapiError(res, toolCallId, "time required");
+  if (!timezone) return vapiError(res, toolCallId, "timezone required");
+
+  const startIso = `${date}T${time}`;
 
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
+
   const { context, page } = await getPage(browser);
 
   try {
@@ -179,13 +258,27 @@ app.post("/cancel", async (req, res) => {
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    return res.json({
+    // TODO: implement real cancel selectors.
+    return vapiResult(res, toolCallId, {
       ok: true,
-      message: "Server deployed. Cancel automation selectors not finalized yet.",
-      received: { clientName, staffName, startIso }
+      status: "received",
+      message:
+        "Logged in successfully. Cancel automation not implemented yet (selectors needed).",
+      mapped: {
+        customerName,
+        customerPhone: customerPhone || null,
+        startIso,
+        timezone,
+        notes: notes || null
+      }
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return vapiResult(
+      res,
+      toolCallId,
+      { ok: false, error: e?.message || String(e) },
+      500
+    );
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
