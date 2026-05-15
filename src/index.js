@@ -172,128 +172,21 @@ app.post("/availability", (req, res) => {
     ]
   });
 });
-/**
-// 1) Generate a fresh screenshot (logs into SalonBiz first)
-app.get("/debug/salonbiz", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (typeof cookiesExpired === "function" && cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    await page.waitForTimeout(1500);
-    await page.screenshot({ path: "/tmp/salonbiz.png", fullPage: true });
-
-    return res.status(200).json({
-      ok: true,
-      message: "Screenshot saved. Open /debug/salonbiz.png to view it."
-    });
-  } catch (e) {
-    console.error("DEBUG /debug/salonbiz error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-// 2) View the last generated screenshot
-app.get("/debug/salonbiz.png", (req, res) => {
-  return res.sendFile("/tmp/salonbiz.png");
-});
-app.post("/book", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  const args = extractArgs(req);
-
-  const {
-    customerName,
-    customerPhone,
-    service,
-    stylist,
-    date,
-    time,
-    timezone,
-    notes,
-    email
-  } = args;
-
-  if (!customerName) return vapiError(res, toolCallId, "customerName required");
-  if (!service) return vapiError(res, toolCallId, "service required");
-  if (!date) return vapiError(res, toolCallId, "date required");
-  if (!time) return vapiError(res, toolCallId, "time required");
-  if (!timezone) return vapiError(res, toolCallId, "timezone required");
-
-  const parts = String(customerName).trim().split(/\s+/).filter(Boolean);
-  const firstName = parts[0] || "";
-  const lastName = parts.slice(1).join(" ") || "";
-
-  if (!firstName || !lastName) {
-    return vapiError(
-      res,
-      toolCallId,
-      "customerName must include first and last name"
-    );
-  }
-
-  const startIso = `${date}T${time}`;
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    // TODO: implement real booking selectors
-      return vapiRespond(res, toolCallId, {
+return vapiRespond(res, toolCallId, {
   ok: false,
   status: "not_implemented",
   message:
-    "Booking automation not implemented yet. The system logged in, but could not complete the booking."
-});
-      status: "received",
-      message:
-        "Logged in successfully. Booking automation not implemented yet (selectors needed).",
-      mapped: {
-        client: { firstName, lastName, phone: customerPhone || "" },
-        serviceName: service,
-        staffName: stylist || "Any",
-        startIso,
-        timezone,
-        notes: notes || null,
-        email: email || null
-      }
-    });
-  } catch (e) {
-    return vapiRespond(
-      res,
-      toolCallId,
-      { ok: false, error: e?.message || String(e) },
-      500
-    );
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
+    "Booking automation not implemented yet. The system logged in, but could not complete the booking.",
+  mapped: {
+    client: { firstName, lastName, phone: customerPhone || "" },
+    serviceName: service,
+    staffName: stylist || "Any",
+    startIso,
+    timezone,
+    notes: notes || null,
+    email: email || null
   }
 });
-
-/**
- * Cancel endpoint for salonbiz_cancel_appointment
- * Expects args:
- * { customerName, customerPhone?, date, time, timezone, notes?, confirmationRequired }
- */
 app.post("/cancel", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
