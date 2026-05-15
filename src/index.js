@@ -51,7 +51,7 @@ async function loginIfNeeded(page) {
 
   // Navigate to a page that forces auth in the backoffice
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-    waitUntil: "domcontentloaded"
+  waitUntil: "domcontentloaded"
   });
 
   // If password input exists, we need to log in
