@@ -173,10 +173,41 @@ app.post("/availability", (req, res) => {
   });
 });
 /**
- * Booking endpoint for salonbiz_book_appointment
- * Expects args:
- * { customerName, customerPhone, service, stylist, date, time, timezone, notes?, email? }
- */
+// 1) Generate a fresh screenshot (logs into SalonBiz first)
+app.get("/debug/salonbiz", async (req, res) => {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const { context, page } = await getPage(browser);
+
+  try {
+    if (typeof cookiesExpired === "function" && cookiesExpired()) cookieState = null;
+
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: "/tmp/salonbiz.png", fullPage: true });
+
+    return res.status(200).json({
+      ok: true,
+      message: "Screenshot saved. Open /debug/salonbiz.png to view it."
+    });
+  } catch (e) {
+    console.error("DEBUG /debug/salonbiz error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+// 2) View the last generated screenshot
+app.get("/debug/salonbiz.png", (req, res) => {
+  return res.sendFile("/tmp/salonbiz.png");
+});
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
