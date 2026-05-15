@@ -348,8 +348,8 @@ app.get("/debug/screenshot", async (req, res) => {
   }
 });
 
-// ---- debug: click the pink header Create button and screenshot before/after ----
-app.get("/debug/click_create", async (req, res) => {
+// ---- debug: click a calendar slot and screenshot before/after ----
+app.get("/debug/click_slot", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -357,61 +357,47 @@ app.get("/debug/click_create", async (req, res) => {
 
   const { context, page } = await getPage(browser);
 
-  let step = "start";
-
   try {
     if (cookiesExpired()) cookieState = null;
 
-    step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    step = "goto appointmentbook";
     await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
       waitUntil: "domcontentloaded"
     });
 
-    await page.waitForTimeout(2000);
-    await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
+    await page.waitForTimeout(2500);
+    await page.screenshot({ path: "/tmp/slot_before.png", fullPage: true });
 
-    step = "click pink header create";
-    const headerCreate = page
-      .locator("header.main-header")
-      .locator(':is(button, a, div, span):has-text("Create")')
-      .first();
-
-    await headerCreate.click({ timeout: 15000 });
+    await page.mouse.click(500, 300);
 
     await page.waitForTimeout(1500);
-    await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
+    await page.screenshot({ path: "/tmp/slot_after.png", fullPage: true });
 
     return res.status(200).json({
       ok: true,
       message:
-        "Saved /tmp/create_before.png and /tmp/create_after.png. Open /debug/create_before.png and /debug/create_after.png"
+        "Saved /tmp/slot_before.png and /tmp/slot_after.png. Open /debug/slot_before.png and /debug/slot_after.png"
     });
   } catch (e) {
-    console.error("DEBUG /debug/click_create error at step:", step, e);
-    return res.status(500).json({
-      ok: false,
-      step,
-      error: e?.message || String(e)
-    });
+    console.error("DEBUG /debug/click_slot error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
 });
 
-app.get("/debug/create_before.png", (req, res) => {
-  return res.sendFile("/tmp/create_before.png");
+app.get("/debug/slot_before.png", (req, res) => {
+  return res.sendFile("/tmp/slot_before.png");
 });
 
-app.get("/debug/create_after.png", (req, res) => {
-  return res.sendFile("/tmp/create_after.png");
+app.get("/debug/slot_after.png", (req, res) => {
+  return res.sendFile("/tmp/slot_after.png");
 });
 
-// ---- debug: open Create + dump right panel snippet ----
+// ---- debug: open Create + dump right panel snippet (no Create click; just waits) ----
 app.get("/debug/create_dom", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -434,20 +420,19 @@ app.get("/debug/create_dom", async (req, res) => {
     });
     await page.waitForTimeout(2500);
 
-    step = "click pink header create";
-    const headerCreate = page
-      .locator("header.main-header")
-      .locator(':is(button, a, div, span):has-text("Create")')
-      .first();
-    await headerCreate.click({ timeout: 15000 });
-    await page.waitForTimeout(1200);
-
-    step = "wait for service input";
-    await page
+    step = "wait for service input (fallback click slot)";
+    const serviceInput = page
       .locator("sbiz-book-right-panel")
       .locator('input[formcontrolname="service"]')
-      .first()
-      .waitFor({ state: "visible", timeout: 15000 });
+      .first();
+
+    const visibleNow = await serviceInput.isVisible().catch(() => false);
+    if (!visibleNow) {
+      await page.mouse.click(500, 300);
+      await page.waitForTimeout(1200);
+    }
+
+    await serviceInput.waitFor({ state: "visible", timeout: 15000 });
 
     step = "screenshot";
     await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
@@ -476,7 +461,7 @@ app.get("/debug/create_form.png", (req, res) => {
   return res.sendFile("/tmp/create_form.png");
 });
 
-// ---- debug: fill the Service field using typeahead and return a screenshot directly ----
+// ---- debug: fill the Service field using typeahead (no Create click; just waits) ----
 app.get("/debug/fill_service", async (req, res) => {
   const service = String(req.query.service || "Shape Me Haircut");
 
@@ -501,19 +486,19 @@ app.get("/debug/fill_service", async (req, res) => {
     });
     await page.waitForTimeout(2500);
 
-    step = "open create (pink header create)";
-    const headerCreate = page
-      .locator("header.main-header")
-      .locator(':is(button, a, div, span):has-text("Create")')
-      .first();
-    await headerCreate.click({ timeout: 15000 });
-    await page.waitForTimeout(1200);
-
-    step = "find service input";
     const serviceInput = page
       .locator("sbiz-book-right-panel")
       .locator('input[formcontrolname="service"]')
       .first();
+
+    step = "ensure panel open (fallback click slot if needed)";
+    const visibleNow = await serviceInput.isVisible().catch(() => false);
+    if (!visibleNow) {
+      await page.mouse.click(500, 300);
+      await page.waitForTimeout(1200);
+    }
+
+    step = "wait for service input";
     await serviceInput.waitFor({ state: "visible", timeout: 15000 });
 
     step = "type service";
