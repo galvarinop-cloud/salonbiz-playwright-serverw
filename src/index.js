@@ -16,7 +16,7 @@ const SALONBIZ_BASE_URL =
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
 const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 
-// Click tuning via env vars (these are working for you now)
+// Click tuning via env vars (working values from your tests)
 const CREATE_CLICK_X_PCT = Number(process.env.CREATE_CLICK_X_PCT || 0.95);
 const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
 
@@ -138,27 +138,35 @@ async function setTextInput(inputLocator, value) {
   await inputLocator.fill(String(value));
 }
 
-async function clickRightPanelCreate(page) {
-  const candidates = [
-    page.locator("sbiz-book-right-panel").locator('button:has-text("Create")'),
-    page.locator("sbiz-book-right-panel").locator('button:has-text("CREATE")'),
-    page
-      .locator("sbiz-book-right-panel")
-      .locator('button[class*="create"]'),
-    page.locator("sbiz-book-right-panel").locator('button[type="submit"]')
-  ];
+/**
+ * Select existing client:
+ * - Types into the Client search box (placeholder "Search by name or contact")
+ * - ArrowDown + Enter to pick the first suggestion
+ */
+async function selectExistingClient(page, query) {
+  const clientSearch = page
+    .locator("sbiz-book-right-panel")
+    .locator('input[placeholder="Search by name or contact"]')
+    .first();
 
-  for (const loc of candidates) {
-    const count = await loc.count().catch(() => 0);
-    if (count > 0) {
-      const btn = loc.first();
-      if (await btn.isVisible().catch(() => false)) {
-        await btn.click({ timeout: 15000 });
-        return true;
-      }
-    }
-  }
-  return false;
+  await clientSearch.waitFor({ state: "visible", timeout: 15000 });
+  await typeaheadSelect(clientSearch, query);
+}
+
+/**
+ * Click the "Create" button next to the client search (to create a new client).
+ * This opens a modal/panel we need to inspect and then automate.
+ */
+async function clickClientCreateButton(page) {
+  const btn = page
+    .locator("sbiz-book-right-panel")
+    .locator("sbiz-search-client")
+    .locator('button:has-text("Create")')
+    .last();
+
+  await btn.waitFor({ state: "visible", timeout: 15000 });
+  await btn.click({ timeout: 15000 });
+  await page.waitForTimeout(1200);
 }
 
 // ---- Vapi webhook helpers ----
@@ -210,26 +218,29 @@ app.post("/availability", (req, res) => {
   });
 });
 
-// ---- book (first-pass automation) ----
+// ---- book (still WIP; will be upgraded after we map New Client DOM) ----
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
 
   const {
+    isNewClient,
     customerName,
     customerPhone,
+    customerEmail,
     service,
     stylist,
-    date, // YYYY-MM-DD
-    time, // HH:MM (24h)
+    startTime, // ex: "2:30 PM" (SalonBiz startTime field seems to accept this)
+    customDuration, // ex: "60"
+    requestReason,
     notes
   } = args;
 
+  if (isNewClient == null)
+    return vapiError(res, toolCallId, "isNewClient required (true/false)");
   if (!customerName) return vapiError(res, toolCallId, "customerName required");
   if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
   if (!service) return vapiError(res, toolCallId, "service required");
-  if (!date) return vapiError(res, toolCallId, "date required");
-  if (!time) return vapiError(res, toolCallId, "time required");
 
   const browser = await chromium.launch({
     headless: true,
@@ -254,69 +265,89 @@ app.post("/book", async (req, res) => {
     step = "open create panel";
     await ensureCreatePanelOpen(page);
 
-    const panel = page.locator("sbiz-book-right-panel");
+    step = "client";
+    if (isNewClient) {
+      // We will implement this after we inspect the new-client DOM
+      await clickClientCreateButton(page);
 
-    step = "client fields (best-effort)";
-    const firstNameInput = panel.locator('input[formcontrolname="firstName"]').first();
-    const lastNameInput = panel.locator('input[formcontrolname="lastName"]').first();
-    const phoneInput = panel.locator('input[formcontrolname="phone"]').first();
-
-    const parts = String(customerName).trim().split(/\s+/).filter(Boolean);
-    const first = parts[0] || "";
-    const last = parts.slice(1).join(" ") || "";
-
-    if (await firstNameInput.count()) await setTextInput(firstNameInput, first);
-    if (await lastNameInput.count()) await setTextInput(lastNameInput, last);
-    if (await phoneInput.count()) await setTextInput(phoneInput, customerPhone);
-
-    step = "service";
-    const serviceInput = panel.locator('input[formcontrolname="service"]').first();
-    await serviceInput.waitFor({ state: "visible", timeout: 15000 });
-    await typeaheadSelect(serviceInput, service);
-
-    step = "stylist (optional best-effort)";
-    if (stylist) {
-      const staffInput = panel
-        .locator('input[formcontrolname="staff"], input[formcontrolname="stylist"]')
-        .first();
-      if ((await staffInput.count().catch(() => 0)) > 0) {
-        await typeaheadSelect(staffInput, stylist);
-      }
+      await page.screenshot({ path: "/tmp/new_client_opened.png", fullPage: true }).catch(() => {});
+      return vapiRespond(res, toolCallId, {
+        ok: false,
+        step,
+        status: "needs_new_client_dom",
+        message:
+          "New client creation flow opened, but not automated yet. Run /debug/new_client_dom to capture selectors.",
+        debugScreenshot: "/tmp/new_client_opened.png"
+      });
+    } else {
+      // Existing client: search by name or phone (we’ll use name + phone)
+      const query = `${customerName} ${customerPhone}`.trim();
+      await selectExistingClient(page, query);
     }
 
-    step = "date/time (best-effort)";
-    const dateInput = panel
-      .locator('input[formcontrolname="date"], input[formcontrolname="startDate"]')
+    step = "fill service";
+    const serviceInput = page
+      .locator("sbiz-book-right-panel")
+      .locator('input[formcontrolname="service"]')
       .first();
-    const timeInput = panel
-      .locator('input[formcontrolname="time"], input[formcontrolname="startTime"]')
-      .first();
+    await typeaheadSelect(serviceInput, service);
 
-    if ((await dateInput.count().catch(() => 0)) > 0) await setTextInput(dateInput, date);
-    if ((await timeInput.count().catch(() => 0)) > 0) await setTextInput(timeInput, time);
+    step = "fill staff (optional)";
+    if (stylist) {
+      const staffInput = page
+        .locator("sbiz-book-right-panel")
+        .locator('input[formcontrolname="staff"]')
+        .first();
+      await typeaheadSelect(staffInput, stylist);
+    }
 
-    step = "notes (optional)";
+    step = "fill startTime (optional)";
+    if (startTime) {
+      const startInput = page
+        .locator("sbiz-book-right-panel")
+        .locator('input[formcontrolname="startTime"]')
+        .first();
+      await setTextInput(startInput, startTime);
+    }
+
+    step = "fill customDuration (optional)";
+    if (customDuration) {
+      const durInput = page
+        .locator("sbiz-book-right-panel")
+        .locator('input[formcontrolname="customDuration"]')
+        .first();
+      await setTextInput(durInput, customDuration);
+    }
+
+    step = "fill requestReason (optional)";
+    if (requestReason) {
+      const reqInput = page
+        .locator("sbiz-book-right-panel")
+        .locator('input[formcontrolname="requestReason"]')
+        .first();
+      await setTextInput(reqInput, requestReason);
+    }
+
+    // Notes isn't in snippet yet; likely below. We'll handle after we confirm.
     if (notes) {
-      const notesInput = panel.locator('textarea[formcontrolname="notes"], textarea').first();
+      const notesInput = page
+        .locator("sbiz-book-right-panel")
+        .locator('textarea[formcontrolname="notes"], textarea')
+        .first();
       if ((await notesInput.count().catch(() => 0)) > 0) {
         await setTextInput(notesInput, notes);
       }
     }
 
-    step = "click right-panel final create";
-    const clicked = await clickRightPanelCreate(page);
-    if (!clicked) {
-      await page.screenshot({ path: "/tmp/book_error.png", fullPage: true }).catch(() => {});
-      throw new Error('Could not find/click the right-panel final "Create" button');
-    }
-
-    await page.waitForTimeout(1500);
-    await page.screenshot({ path: "/tmp/book_after.png", fullPage: true }).catch(() => {});
+    await page.screenshot({ path: "/tmp/book_filled.png", fullPage: true }).catch(() => {});
 
     return vapiRespond(res, toolCallId, {
       ok: true,
-      message: "Attempted to create appointment. Verify in SalonBiz.",
-      step
+      step,
+      status: "filled_fields_only",
+      message:
+        "Filled client/service/staff/time/length fields. Next step is clicking the final pink Create button and handling notes/confirmation.",
+      debugScreenshot: "/tmp/book_filled.png"
     });
   } catch (e) {
     console.error("BOOK error at step:", step, e);
@@ -398,7 +429,7 @@ app.get("/debug/create_before.png", (req, res) => res.sendFile("/tmp/create_befo
 app.get("/debug/create_after.png", (req, res) => res.sendFile("/tmp/create_after.png"));
 app.get("/debug/create_error.png", (req, res) => res.sendFile("/tmp/create_error.png"));
 
-// ---- debug: dump right panel DOM ----
+// ---- debug: dump right panel DOM (already working) ----
 app.get("/debug/create_dom", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -448,6 +479,89 @@ app.get("/debug/create_dom", async (req, res) => {
 });
 
 app.get("/debug/create_form.png", (req, res) => res.sendFile("/tmp/create_form.png"));
+
+/**
+ * NEW: debug route to capture NEW CLIENT modal/panel DOM.
+ * Steps:
+ * 1) open create panel
+ * 2) click Client -> Create
+ * 3) screenshot + return HTML of whichever container popped up
+ */
+app.get("/debug/new_client_dom", async (req, res) => {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const { context, page } = await getPage(browser);
+  let step = "start";
+
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    step = "login";
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    step = "goto appointmentbook";
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
+    await page.waitForTimeout(2500);
+
+    step = "open create panel";
+    await ensureCreatePanelOpen(page);
+
+    step = "click client create";
+    await clickClientCreateButton(page);
+
+    step = "screenshot";
+    await page.screenshot({ path: "/tmp/new_client.png", fullPage: true });
+
+    // Common patterns for modals in Angular apps:
+    const modalCandidates = [
+      page.locator("ngb-modal-window").first(),
+      page.locator(".modal").first(),
+      page.locator(".cdk-overlay-container").first(),
+      page.locator("sbiz-book-right-panel").first() // fallback
+    ];
+
+    let html = null;
+    let matched = null;
+
+    for (const loc of modalCandidates) {
+      const count = await loc.count().catch(() => 0);
+      if (count > 0) {
+        const visible = await loc.isVisible().catch(() => false);
+        if (visible) {
+          html = await loc.evaluate((el) => el.innerHTML);
+          matched = await loc.evaluate((el) => el.tagName + (el.className ? `.${el.className}` : ""));
+          break;
+        }
+      }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      step,
+      matchedContainer: matched,
+      screenshot: "/debug/new_client.png",
+      htmlSnippet: (html || "").slice(0, 180000)
+    });
+  } catch (e) {
+    console.error("DEBUG new_client_dom error at step:", step, e);
+    await page.screenshot({ path: "/tmp/new_client_error.png", fullPage: true }).catch(() => {});
+    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/new_client.png", (req, res) => res.sendFile("/tmp/new_client.png"));
+app.get("/debug/new_client_error.png", (req, res) =>
+  res.sendFile("/tmp/new_client_error.png")
+);
 
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
