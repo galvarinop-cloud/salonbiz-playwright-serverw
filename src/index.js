@@ -488,7 +488,7 @@ app.get("/debug/click_slot", async (req, res) => {
     return res.status(200).json({
       ok: true,
       message:
-        "Saved /tmp/slot_before.png and /tmp/slot_after.png. Open /debug/slot_before.png and /debug/slot_after.png"
+        "Saved /tmp/slot_before.png and /debug/slot_before.png and /debug/slot_after.png"
     });
   } catch (e) {
     console.error("DEBUG /debug/click_slot error:", e);
@@ -562,7 +562,7 @@ app.get("/debug/create_after.png", (req, res) => {
   return res.sendFile("/tmp/create_after.png");
 });
 
-// ---- debug: open Create form and return DOM snippet + screenshot ----
+// ---- debug: open Create form and return body html snippet (body only) ----
 app.get("/debug/create_dom", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -571,38 +571,61 @@ app.get("/debug/create_dom", async (req, res) => {
 
   const { context, page } = await getPage(browser);
 
+  let step = "start";
+
   try {
     if (cookiesExpired()) cookieState = null;
 
+    step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
 
+    step = "goto appointmentbook";
     await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
       waitUntil: "domcontentloaded"
     });
-
     await page.waitForTimeout(2500);
 
+    step = "click create";
     const createBtn = page
+      .locator("body")
       .locator(
         'button:has-text("Create"), button:has-text("New"), button:has-text("Add")'
       )
       .first();
-
     await createBtn.click({ timeout: 10000 });
-    await page.waitForTimeout(2000);
 
+    step = "wait for form to render";
+    const formRoot = page
+      .locator("body")
+      .locator('[role="dialog"], .k-dialog, .k-window, .modal, .drawer, .panel')
+      .first();
+
+    await Promise.race([
+      formRoot.waitFor({ state: "visible", timeout: 15000 }),
+      page
+        .locator("body")
+        .locator('input[type="text"], textarea, [role="combobox"] input')
+        .first()
+        .waitFor({ state: "visible", timeout: 15000 })
+    ]);
+
+    step = "screenshot";
+    await page.waitForTimeout(1000);
     await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
 
-    const html = await page.content();
+    step = "extract body html";
+    const bodyHtml = await page.locator("body").evaluate((b) => b.innerHTML);
+
     return res.status(200).json({
       ok: true,
+      step,
       url: page.url(),
-      htmlSnippet: html.slice(0, 90000)
+      bodyHtmlSnippet: String(bodyHtml).slice(0, 180000)
     });
   } catch (e) {
-    console.error("DEBUG /debug/create_dom error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    console.error("DEBUG /debug/create_dom error at step:", step, e);
+    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
@@ -641,6 +664,7 @@ app.get("/debug/fill_service", async (req, res) => {
 
     step = "open create";
     const createBtn = page
+      .locator("body")
       .locator(
         'button:has-text("Create"), button:has-text("New"), button:has-text("Add")'
       )
@@ -650,6 +674,7 @@ app.get("/debug/fill_service", async (req, res) => {
 
     step = "find service input";
     const serviceInput = page
+      .locator("body")
       .locator('input[placeholder*="Service" i], input[aria-label*="Service" i]')
       .first();
 
