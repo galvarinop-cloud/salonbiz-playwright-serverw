@@ -101,31 +101,28 @@ async function loginIfNeeded(page) {
 }
 
 /**
- * Opens the appointment create panel by clicking a real scheduler column
- * (NOT the left time axis). Clicks towards the right side to avoid gutters.
+ * Opens the appointment create panel by clicking the scheduler DATA area.
+ * This avoids the left time-axis and other gutters.
  */
 async function openCreatePanelByClickingGrid(page) {
-  const col = page
-    .locator("#dhtmlxScheduler .dhx_cal_data .dhx_scale_holder_now")
-    .first();
+  const data = page.locator("#dhtmlxScheduler .dhx_cal_data").first();
+  await data.waitFor({ state: "visible", timeout: 15000 });
 
-  await col.waitFor({ state: "visible", timeout: 15000 });
+  const box = await data.boundingBox();
+  if (!box) throw new Error("Scheduler data area bounding box not found");
 
-  const box = await col.boundingBox();
-  if (!box) throw new Error("Scheduler column bounding box not found");
-
-  // Click near the RIGHT side of the column to avoid left gutter overlays
-  const x = box.x + box.width * 0.75;
-  const y = box.y + Math.min(160, Math.max(80, box.height * 0.25));
+  // Click ~85% down the grid (often empty late-day area)
+  const x = box.x + box.width * 0.6; // middle-right
+  const y = box.y + box.height * 0.85; // late day
 
   await page.mouse.click(x, y);
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2000);
 }
 
 /**
  * Ensures the create panel is open by:
  * 1) checking if service input is visible
- * 2) if not, clicking scheduler grid to open it
+ * 2) if not, clicking scheduler grid data area to open it
  */
 async function ensureCreatePanelOpen(page) {
   const serviceInput = page
@@ -415,7 +412,7 @@ app.get("/debug/click_slot", async (req, res) => {
     await page.waitForTimeout(2500);
     await page.screenshot({ path: "/tmp/slot_before.png", fullPage: true });
 
-    step = "click real scheduler column";
+    step = "click scheduler data area";
     await openCreatePanelByClickingGrid(page);
 
     // Validate create panel actually opened
@@ -424,7 +421,7 @@ app.get("/debug/click_slot", async (req, res) => {
       .locator("sbiz-book-right-panel")
       .locator('input[formcontrolname="service"]')
       .first()
-      .waitFor({ state: "visible", timeout: 8000 });
+      .waitFor({ state: "visible", timeout: 15000 });
 
     await page.screenshot({ path: "/tmp/slot_after.png", fullPage: true });
 
