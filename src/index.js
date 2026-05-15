@@ -101,13 +101,13 @@ async function loginIfNeeded(page) {
   await userInput.fill("").catch(() => {});
   await userInput.type(String(SALONBIZ_USERNAME), { delay: 30 });
 
-  // Type password (force focus + clear + type)
+  // Type password
   await passInput.scrollIntoViewIfNeeded().catch(() => {});
   await passInput.click({ timeout: 5000, force: true }).catch(() => {});
   await passInput.fill("").catch(() => {});
   await passInput.type(String(SALONBIZ_PASSWORD), { delay: 30 });
 
-  // If it didn't stick, try again via page.keyboard
+  // If it didn't stick, try keyboard typing
   const passValue = await passInput.inputValue().catch(() => "");
   if (!passValue) {
     await passInput.focus().catch(() => {});
@@ -129,6 +129,7 @@ async function loginIfNeeded(page) {
   await page.waitForTimeout(4000);
 }
 
+// ---- Vapi tool-call helpers ----
 function extractToolCall(req) {
   return (
     req.body?.message?.toolCallList?.[0] ||
@@ -173,10 +174,12 @@ function vapiError(res, toolCallId, message, statusCode = 400) {
   return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
+// ---- health ----
 app.get("/health", (req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
+// ---- availability ----
 app.post("/availability", (req, res) => {
   console.log("AVAILABILITY WEBHOOK BODY:", JSON.stringify(req.body));
   const toolCall = extractToolCall(req);
@@ -202,6 +205,7 @@ app.post("/availability", (req, res) => {
   });
 });
 
+// ---- book ----
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -270,6 +274,7 @@ app.post("/book", async (req, res) => {
   }
 });
 
+// ---- cancel ----
 app.post("/cancel", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -328,6 +333,7 @@ app.post("/cancel", async (req, res) => {
   }
 });
 
+// ---- debug: screenshot (returns PNG) ----
 app.get("/debug/screenshot", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -357,6 +363,7 @@ app.get("/debug/screenshot", async (req, res) => {
   }
 });
 
+// ---- debug: persist screenshot to /tmp/salonbiz.png ----
 app.get("/debug/salonbiz", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -391,6 +398,7 @@ app.get("/debug/salonbiz.png", (req, res) => {
   return res.sendFile("/tmp/salonbiz.png");
 });
 
+// ---- debug: login before/after screenshots ----
 app.get("/debug/login", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -432,6 +440,37 @@ app.get("/debug/login_before.png", (req, res) => {
 
 app.get("/debug/login_after.png", (req, res) => {
   return res.sendFile("/tmp/login_after.png");
+});
+
+// ---- debug: dump initial login DOM snippet ----
+app.get("/debug/login_dom", async (req, res) => {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const { context, page } = await getPage(browser);
+
+  try {
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
+
+    await page.waitForTimeout(2000);
+
+    const html = await page.content();
+
+    return res.status(200).json({
+      ok: true,
+      url: page.url(),
+      htmlSnippet: html.slice(0, 60000)
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
 });
 
 app.listen(PORT, () => {
