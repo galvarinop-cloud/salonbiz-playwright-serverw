@@ -1,3 +1,4 @@
+
 import express from "express";
 import { chromium } from "playwright";
 
@@ -229,7 +230,7 @@ app.post("/book", async (req, res) => {
       ok: false,
       status: "not_implemented",
       message:
-        "Booking automation not implemented yet. Login works; create form is reachable; next step is selecting service/staff/start/length/resource and saving.",
+        "Booking automation not implemented yet. Login works; right panel form is reachable; next step is selecting service/staff/start/length/res/notes and saving.",
       mapped: {
         client: { firstName, lastName, phone: customerPhone || "" },
         serviceName: service,
@@ -458,56 +459,7 @@ app.get("/debug/login_dom", async (req, res) => {
   }
 });
 
-// ---- debug: click a calendar slot and screenshot before/after ----
-app.get("/debug/click_slot", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
-
-    await page.waitForTimeout(2500);
-    await page.screenshot({ path: "/tmp/slot_before.png", fullPage: true });
-
-    await page.mouse.click(750, 420);
-
-    await page.waitForTimeout(1500);
-    await page.screenshot({ path: "/tmp/slot_after.png", fullPage: true });
-
-    return res.status(200).json({
-      ok: true,
-      message:
-        "Saved /tmp/slot_before.png and /tmp/slot_after.png. Open /debug/slot_before.png and /debug/slot_after.png"
-    });
-  } catch (e) {
-    console.error("DEBUG /debug/click_slot error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/slot_before.png", (req, res) => {
-  return res.sendFile("/tmp/slot_before.png");
-});
-
-app.get("/debug/slot_after.png", (req, res) => {
-  return res.sendFile("/tmp/slot_after.png");
-});
-
-// ---- debug: click Create button and screenshot before/after ----
+// ---- debug: click Create (right panel) and screenshot before/after ----
 app.get("/debug/click_create", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -529,14 +481,14 @@ app.get("/debug/click_create", async (req, res) => {
     await page.waitForTimeout(2500);
     await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
 
-    // Try the Create button (robust text match)
+    // Right-panel Create button (inside sbiz-search-client)
     const createBtn = page
-      .locator(
-        'button:has-text("Create"), button:has-text("New"), button:has-text("Add")'
-      )
+      .locator("sbiz-book-right-panel")
+      .locator("sbiz-search-client")
+      .locator('button:has-text("Create")')
       .first();
 
-    await createBtn.click({ timeout: 10000 });
+    await createBtn.click({ timeout: 15000 });
 
     await page.waitForTimeout(1500);
     await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
@@ -587,42 +539,35 @@ app.get("/debug/create_dom", async (req, res) => {
     });
     await page.waitForTimeout(2500);
 
-    step = "click create";
+    step = "open create (right panel)";
     const createBtn = page
-      .locator("body")
-      .locator(
-        'button:has-text("Create"), button:has-text("New"), button:has-text("Add")'
-      )
+      .locator("sbiz-book-right-panel")
+      .locator("sbiz-search-client")
+      .locator('button:has-text("Create")')
       .first();
-    await createBtn.click({ timeout: 10000 });
+    await createBtn.click({ timeout: 15000 });
 
-    step = "wait for form to render";
-    const formRoot = page
-      .locator("body")
-      .locator('[role="dialog"], .k-dialog, .k-window, .modal, .drawer, .panel')
-      .first();
-
-    await Promise.race([
-      formRoot.waitFor({ state: "visible", timeout: 15000 }),
-      page
-        .locator("body")
-        .locator('input[type="text"], textarea, [role="combobox"] input')
-        .first()
-        .waitFor({ state: "visible", timeout: 15000 })
-    ]);
+    step = "wait for service input";
+    await page
+      .locator("sbiz-book-right-panel")
+      .locator('input[formcontrolname="service"]')
+      .first()
+      .waitFor({ state: "visible", timeout: 15000 });
 
     step = "screenshot";
     await page.waitForTimeout(1000);
     await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
 
-    step = "extract body html";
-    const bodyHtml = await page.locator("body").evaluate((b) => b.innerHTML);
+    step = "extract right panel html";
+    const panelHtml = await page
+      .locator("sbiz-book-right-panel")
+      .evaluate((el) => el.innerHTML);
 
     return res.status(200).json({
       ok: true,
       step,
       url: page.url(),
-      bodyHtmlSnippet: String(bodyHtml).slice(0, 180000)
+      rightPanelHtmlSnippet: String(panelHtml).slice(0, 180000)
     });
   } catch (e) {
     console.error("DEBUG /debug/create_dom error at step:", step, e);
@@ -637,7 +582,7 @@ app.get("/debug/create_form.png", (req, res) => {
   return res.sendFile("/tmp/create_form.png");
 });
 
-// ---- debug: fill the Service field using typeahead and return a screenshot directly ----
+// ---- debug: fill the Service field using typeahead (right panel) and return a screenshot directly ----
 app.get("/debug/fill_service", async (req, res) => {
   const service = String(req.query.service || "Shape Me Haircut");
 
@@ -663,32 +608,27 @@ app.get("/debug/fill_service", async (req, res) => {
     });
     await page.waitForTimeout(2500);
 
-    step = "open create";
+    step = "open create (right panel)";
     const createBtn = page
-      .locator("body")
-      .locator(
-        'button:has-text("Create"), button:has-text("New"), button:has-text("Add")'
-      )
+      .locator("sbiz-book-right-panel")
+      .locator("sbiz-search-client")
+      .locator('button:has-text("Create")')
       .first();
-    await createBtn.click({ timeout: 10000 });
-    await page.waitForTimeout(2000);
+    await createBtn.click({ timeout: 15000 });
+    await page.waitForTimeout(1200);
 
     step = "find service input";
     const serviceInput = page
       .locator("sbiz-book-right-panel")
       .locator('input[formcontrolname="service"]')
       .first();
-
     await serviceInput.waitFor({ state: "visible", timeout: 15000 });
 
     step = "type service";
     await serviceInput.click();
-
-    // Select all, then type (more reliable for these typeahead widgets)
     await page.keyboard.down("Control");
     await page.keyboard.press("KeyA");
     await page.keyboard.up("Control");
-
     await page.keyboard.type(service, { delay: 40 });
 
     step = "select suggestion";
