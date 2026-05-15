@@ -101,25 +101,24 @@ async function loginIfNeeded(page) {
 }
 
 /**
- * Opens the appointment create panel by clicking a real scheduler grid column.
- * This is much more reliable than hard-coded coordinates.
+ * Opens the appointment create panel by clicking a real scheduler column
+ * (NOT the left time axis). Clicks towards the right side to avoid gutters.
  */
 async function openCreatePanelByClickingGrid(page) {
-  const cell = page
+  const col = page
     .locator("#dhtmlxScheduler .dhx_cal_data .dhx_scale_holder_now")
     .first();
 
-  await cell.waitFor({ state: "visible", timeout: 15000 });
+  await col.waitFor({ state: "visible", timeout: 15000 });
 
-  const box = await cell.boundingBox();
-  if (!box) throw new Error("Scheduler cell bounding box not found");
+  const box = await col.boundingBox();
+  if (!box) throw new Error("Scheduler column bounding box not found");
 
-  // Click somewhere safely inside the column, away from headers/edges
-  await page.mouse.click(
-    box.x + box.width / 2,
-    box.y + Math.min(120, Math.max(40, box.height / 3))
-  );
+  // Click near the RIGHT side of the column to avoid left gutter overlays
+  const x = box.x + box.width * 0.75;
+  const y = box.y + Math.min(160, Math.max(80, box.height * 0.25));
 
+  await page.mouse.click(x, y);
   await page.waitForTimeout(1500);
 }
 
@@ -419,6 +418,14 @@ app.get("/debug/click_slot", async (req, res) => {
     step = "click real scheduler column";
     await openCreatePanelByClickingGrid(page);
 
+    // Validate create panel actually opened
+    step = "verify service input visible";
+    await page
+      .locator("sbiz-book-right-panel")
+      .locator('input[formcontrolname="service"]')
+      .first()
+      .waitFor({ state: "visible", timeout: 8000 });
+
     await page.screenshot({ path: "/tmp/slot_after.png", fullPage: true });
 
     return res.status(200).json({
@@ -428,6 +435,7 @@ app.get("/debug/click_slot", async (req, res) => {
     });
   } catch (e) {
     console.error("DEBUG /debug/click_slot error at step:", step, e);
+    await page.screenshot({ path: "/tmp/slot_error.png", fullPage: true }).catch(() => {});
     return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
   } finally {
     await context.close().catch(() => {});
@@ -441,6 +449,10 @@ app.get("/debug/slot_before.png", (req, res) => {
 
 app.get("/debug/slot_after.png", (req, res) => {
   return res.sendFile("/tmp/slot_after.png");
+});
+
+app.get("/debug/slot_error.png", (req, res) => {
+  return res.sendFile("/tmp/slot_error.png");
 });
 
 // ---- debug: open Create + dump right panel snippet ----
@@ -543,13 +555,13 @@ app.get("/debug/fill_service", async (req, res) => {
     return res.status(200).send(buf);
   } catch (e) {
     console.error("DEBUG /debug/fill_service error at step:", step, e);
-    // Helpful extra artifact:
-    await page.screenshot({ path: "/tmp/fill_service_error.png", fullPage: true }).catch(() => {});
+    await page
+      .screenshot({ path: "/tmp/fill_service_error.png", fullPage: true })
+      .catch(() => {});
     return res.status(500).json({
       ok: false,
       step,
-      error: e?.message || String(e),
-      debugScreenshot: "/tmp/fill_service_error.png"
+      error: e?.message || String(e)
     });
   } finally {
     await context.close().catch(() => {});
