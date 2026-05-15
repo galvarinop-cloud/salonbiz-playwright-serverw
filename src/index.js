@@ -43,17 +43,10 @@ async function saveCookies(context) {
   cookieStateSetAt = Date.now();
 }
 
-async function firstVisible(locator) {
-  const n = await locator.count();
-  for (let i = 0; i < n; i++) {
-    const item = locator.nth(i);
-    try {
-      if (await item.isVisible()) return item;
-    } catch {}
-  }
-  return null;
-}
-
+/**
+ * SalonBiz login.
+ * Uses Angular-friendly value setting + input/change events.
+ */
 async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
@@ -62,69 +55,47 @@ async function loginIfNeeded(page) {
     waitUntil: "domcontentloaded"
   });
 
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2000);
 
-  const passwordAny = page.locator('input[type="password"]');
-  if ((await passwordAny.count()) === 0) return;
+  const userSel = 'input[formcontrolname="username"]';
+  const passSel = 'input[formcontrolname="password"]';
+  const submitSel = 'button[type="submit"]';
 
-  const userCandidates = [
-    page.getByLabel(/username/i),
-    page.getByLabel(/email/i),
-    page.locator('input[name="username"]'),
-    page.locator('input[name="email"]'),
-    page.locator('input[id*="user" i]'),
-    page.locator('input[id*="email" i]'),
-    page.locator('input[placeholder*="username" i]'),
-    page.locator('input[placeholder*="email" i]'),
-    page.locator('input[type="email"]'),
-    page.locator('input[type="text"]')
-  ];
+  // If already logged in, password field won't exist
+  if ((await page.locator(passSel).count()) === 0) return;
 
-  let userInput = null;
-  for (const c of userCandidates) {
-    try {
-      const v = await firstVisible(c);
-      if (v) {
-        userInput = v;
-        break;
-      }
-    } catch {}
-  }
-  if (!userInput) throw new Error("Could not find visible username/email input.");
+  await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
+  await page.waitForSelector(passSel, { state: "visible", timeout: 15000 });
 
-  const passInput = await firstVisible(passwordAny);
-  if (!passInput) throw new Error("Could not find visible password input.");
+  // Set values and fire events that Angular listens to
+  await page.evaluate(
+    ({ userSel, passSel, username, password }) => {
+      const user = document.querySelector(userSel);
+      const pass = document.querySelector(passSel);
+      if (!user || !pass) throw new Error("Login inputs not found");
 
-  // Type username
-  await userInput.scrollIntoViewIfNeeded().catch(() => {});
-  await userInput.click({ timeout: 5000 }).catch(() => {});
-  await userInput.fill("").catch(() => {});
-  await userInput.type(String(SALONBIZ_USERNAME), { delay: 30 });
+      const setNative = (el, value) => {
+        const setter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype,
+          "value"
+        )?.set;
+        setter.call(el, value);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      };
 
-  // Type password
-  await passInput.scrollIntoViewIfNeeded().catch(() => {});
-  await passInput.click({ timeout: 5000, force: true }).catch(() => {});
-  await passInput.fill("").catch(() => {});
-  await passInput.type(String(SALONBIZ_PASSWORD), { delay: 30 });
+      setNative(user, username);
+      setNative(pass, password);
+    },
+    {
+      userSel,
+      passSel,
+      username: String(SALONBIZ_USERNAME),
+      password: String(SALONBIZ_PASSWORD)
+    }
+  );
 
-  // If it didn't stick, try keyboard typing
-  const passValue = await passInput.inputValue().catch(() => "");
-  if (!passValue) {
-    await passInput.focus().catch(() => {});
-    await page.keyboard.type(String(SALONBIZ_PASSWORD), { delay: 30 });
-  }
-
-  const loginBtn = page
-    .locator(
-      'button:has-text("Log in"), button:has-text("Login"), button:has-text("Sign in"), input[type="submit"], button[type="submit"]'
-    )
-    .first();
-
-  if ((await loginBtn.count()) > 0) {
-    await loginBtn.click({ timeout: 5000 });
-  } else {
-    await page.keyboard.press("Enter");
-  }
+  await page.click(submitSel);
 
   await page.waitForTimeout(4000);
 }
@@ -233,7 +204,11 @@ app.post("/book", async (req, res) => {
   const lastName = parts.slice(1).join(" ") || "";
 
   if (!firstName || !lastName) {
-    return vapiError(res, toolCallId, "customerName must include first and last name");
+    return vapiError(
+      res,
+      toolCallId,
+      "customerName must include first and last name"
+    );
   }
 
   const startIso = `${date}T${time}`;
@@ -254,7 +229,7 @@ app.post("/book", async (req, res) => {
       ok: false,
       status: "not_implemented",
       message:
-        "Booking automation not implemented yet. The system attempted login, but could not complete the booking.",
+        "Booking automation not implemented yet. Login should now work; next step is implementing booking selectors.",
       mapped: {
         client: { firstName, lastName, phone: customerPhone || "" },
         serviceName: service,
@@ -267,7 +242,12 @@ app.post("/book", async (req, res) => {
     });
   } catch (e) {
     console.error("BOOK error:", e);
-    return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
+    return vapiRespond(
+      res,
+      toolCallId,
+      { ok: false, error: e?.message || String(e) },
+      500
+    );
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
@@ -315,7 +295,7 @@ app.post("/cancel", async (req, res) => {
       ok: false,
       status: "not_implemented",
       message:
-        "Cancel automation not implemented yet. The system attempted login, but could not complete the cancellation.",
+        "Cancel automation not implemented yet. Login should now work; next step is implementing cancel selectors.",
       mapped: {
         customerName,
         customerPhone: customerPhone || null,
@@ -326,7 +306,12 @@ app.post("/cancel", async (req, res) => {
     });
   } catch (e) {
     console.error("CANCEL error:", e);
-    return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
+    return vapiRespond(
+      res,
+      toolCallId,
+      { ok: false, error: e?.message || String(e) },
+      500
+    );
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
