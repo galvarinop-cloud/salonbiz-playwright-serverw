@@ -44,12 +44,12 @@ async function loginIfNeeded(page) {
     waitUntil: "domcontentloaded"
   });
 
-  const hasLogin =
-    (await page.locator('input[type="password"]').count()) > 0;
-
+  const hasLogin = (await page.locator('input[type="password"]').count()) > 0;
   if (!hasLogin) return;
 
-  const userInput = page.locator('input[type="text"], input[type="email"]').first();
+  const userInput = page
+    .locator('input[type="text"], input[type="email"]')
+    .first();
   const passInput = page.locator('input[type="password"]').first();
 
   await userInput.fill(SALONBIZ_USERNAME);
@@ -81,11 +81,9 @@ app.post("/availability", (req, res) => {
   });
 });
 
-});
 app.post("/book", async (req, res) => {
   const body = req.body || {};
 
-  // NEW: accept Vapi-style args
   const {
     customerName,
     customerPhone,
@@ -98,12 +96,14 @@ app.post("/book", async (req, res) => {
     email
   } = body;
 
-  // Backward-compatible: also accept old shape
   let { client, serviceName, staffName, startIso } = body;
 
-  // If Vapi-style fields are present, map them
   if (customerName || service || stylist || date || time || timezone) {
-    const parts = String(customerName || "").trim().split(/\s+/).filter(Boolean);
+    const parts = String(customerName || "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+
     const firstName = parts[0] || "Unknown";
     const lastName = parts.slice(1).join(" ") || "Unknown";
 
@@ -111,30 +111,34 @@ app.post("/book", async (req, res) => {
       firstName,
       lastName,
       phone: customerPhone || ""
-      // you can include email if your flow needs it
     };
 
     serviceName = service;
     staffName = stylist || "Any";
-
-    // Build an ISO string from date+time+timezone
-    // NOTE: This assumes `time` like "2 PM" or "14:00".
-    // If you standardize time to "HH:mm" it will be more reliable.
     startIso = `${date}T${time}`;
   }
 
-  // Validate (same as before)
   if (!client?.firstName || !client?.lastName) {
-    return res.status(400).json({ error: "customerName required (or client.firstName/client.lastName)" });
+    return res.status(400).json({
+      error: "customerName required (or client.firstName/client.lastName)"
+    });
   }
-  if (!serviceName) return res.status(400).json({ error: "service required (or serviceName)" });
-  if (!staffName) return res.status(400).json({ error: "stylist required (or staffName)" });
-  if (!startIso) return res.status(400).json({ error: "date/time required (or startIso)" });
+  if (!serviceName)
+    return res.status(400).json({ error: "service required (or serviceName)" });
+  if (!staffName)
+    return res.status(400).json({ error: "stylist required (or staffName)" });
+  if (!startIso)
+    return res.status(400).json({ error: "date/time required (or startIso)" });
   if (!timezone) {
-    return res.status(400).json({ error: "timezone required (e.g., America/New_York)" });
+    return res
+      .status(400)
+      .json({ error: "timezone required (e.g., America/New_York)" });
   }
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
   const { context, page } = await getPage(browser);
 
   try {
@@ -143,10 +147,10 @@ app.post("/book", async (req, res) => {
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    // TODO: implement real booking here (selectors)
     return res.json({
       ok: true,
-      message: "Logged in successfully. Booking automation not implemented yet (selectors needed).",
+      message:
+        "Logged in successfully. Booking automation not implemented yet (selectors needed).",
       mapped: { client, serviceName, staffName, startIso, notes, email, timezone }
     });
   } catch (e) {
@@ -163,14 +167,16 @@ app.post("/cancel", async (req, res) => {
   if (!staffName) return res.status(400).json({ error: "staffName required" });
   if (!startIso) return res.status(400).json({ error: "startIso required" });
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
   const { context, page } = await getPage(browser);
 
   try {
     if (cookiesExpired()) cookieState = null;
 
     await loginIfNeeded(page);
-
     await saveCookies(context);
 
     return res.json({
@@ -187,7 +193,10 @@ app.post("/cancel", async (req, res) => {
 });
 
 app.get("/debug/screenshot", async (req, res) => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
   const { context, page } = await getPage(browser);
 
   try {
