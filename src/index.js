@@ -1,4 +1,3 @@
-
 import express from "express";
 import { chromium } from "playwright";
 
@@ -349,174 +348,8 @@ app.get("/debug/screenshot", async (req, res) => {
   }
 });
 
-// ---- debug: persist screenshot to /tmp/salonbiz.png ----
-app.get("/debug/salonbiz", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    await page.waitForTimeout(1500);
-    await page.screenshot({ path: "/tmp/salonbiz.png", fullPage: true });
-
-    return res.status(200).json({
-      ok: true,
-      message: "Screenshot saved. Open /debug/salonbiz.png to view it."
-    });
-  } catch (e) {
-    console.error("DEBUG /debug/salonbiz error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/salonbiz.png", (req, res) => {
-  return res.sendFile("/tmp/salonbiz.png");
-});
-
-// ---- debug: login before/after screenshots ----
-app.get("/debug/login", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-
-  try {
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
-
-    await page.waitForTimeout(1500);
-    await page.screenshot({ path: "/tmp/login_before.png", fullPage: true });
-
-    await loginIfNeeded(page);
-
-    await page.waitForTimeout(2000);
-    await page.screenshot({ path: "/tmp/login_after.png", fullPage: true });
-
-    return res.status(200).json({
-      ok: true,
-      message:
-        "Saved /tmp/login_before.png and /tmp/login_after.png. Open /debug/login_before.png and /debug/login_after.png"
-    });
-  } catch (e) {
-    console.error("DEBUG /debug/login error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/login_before.png", (req, res) => {
-  return res.sendFile("/tmp/login_before.png");
-});
-
-app.get("/debug/login_after.png", (req, res) => {
-  return res.sendFile("/tmp/login_after.png");
-});
-
-// ---- debug: dump initial login DOM snippet ----
-app.get("/debug/login_dom", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-
-  try {
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
-
-    await page.waitForTimeout(2000);
-
-    const html = await page.content();
-
-    return res.status(200).json({
-      ok: true,
-      url: page.url(),
-      htmlSnippet: html.slice(0, 60000)
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-// ---- debug: click Create (right panel) and screenshot before/after ----
+// ---- debug: click the pink header Create button and screenshot before/after ----
 app.get("/debug/click_create", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
-
-    await page.waitForTimeout(2500);
-    await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
-
-    // Right-panel Create button (inside sbiz-search-client)
-    const createBtn = page
-      .locator("sbiz-book-right-panel")
-      .locator("sbiz-search-client")
-      .locator('button:has-text("Create")')
-      .first();
-
-    await createBtn.click({ timeout: 15000 });
-
-    await page.waitForTimeout(1500);
-    await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
-
-    return res.status(200).json({
-      ok: true,
-      message:
-        "Saved /tmp/create_before.png and /tmp/create_after.png. Open /debug/create_before.png and /debug/create_after.png"
-    });
-  } catch (e) {
-    console.error("DEBUG /debug/click_create error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/create_before.png", (req, res) => {
-  return res.sendFile("/tmp/create_before.png");
-});
-
-app.get("/debug/create_after.png", (req, res) => {
-  return res.sendFile("/tmp/create_after.png");
-});
-
-// ---- debug: open Create form and return body html snippet (body only) ----
-app.get("/debug/create_dom", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -537,15 +370,77 @@ app.get("/debug/create_dom", async (req, res) => {
     await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
       waitUntil: "domcontentloaded"
     });
+
+    await page.waitForTimeout(2000);
+    await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
+
+    step = "click pink header create";
+    const headerCreate = page
+      .locator("header.main-header")
+      .locator(':is(button, a, div, span):has-text("Create")')
+      .first();
+
+    await headerCreate.click({ timeout: 15000 });
+
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        "Saved /tmp/create_before.png and /tmp/create_after.png. Open /debug/create_before.png and /debug/create_after.png"
+    });
+  } catch (e) {
+    console.error("DEBUG /debug/click_create error at step:", step, e);
+    return res.status(500).json({
+      ok: false,
+      step,
+      error: e?.message || String(e)
+    });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/create_before.png", (req, res) => {
+  return res.sendFile("/tmp/create_before.png");
+});
+
+app.get("/debug/create_after.png", (req, res) => {
+  return res.sendFile("/tmp/create_after.png");
+});
+
+// ---- debug: open Create + dump right panel snippet ----
+app.get("/debug/create_dom", async (req, res) => {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const { context, page } = await getPage(browser);
+  let step = "start";
+
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    step = "login";
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    step = "goto appointmentbook";
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
     await page.waitForTimeout(2500);
 
-    step = "open create (right panel)";
-    const createBtn = page
-      .locator("sbiz-book-right-panel")
-      .locator("sbiz-search-client")
-      .locator('button:has-text("Create")')
+    step = "click pink header create";
+    const headerCreate = page
+      .locator("header.main-header")
+      .locator(':is(button, a, div, span):has-text("Create")')
       .first();
-    await createBtn.click({ timeout: 15000 });
+    await headerCreate.click({ timeout: 15000 });
+    await page.waitForTimeout(1200);
 
     step = "wait for service input";
     await page
@@ -555,7 +450,6 @@ app.get("/debug/create_dom", async (req, res) => {
       .waitFor({ state: "visible", timeout: 15000 });
 
     step = "screenshot";
-    await page.waitForTimeout(1000);
     await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
 
     step = "extract right panel html";
@@ -582,7 +476,7 @@ app.get("/debug/create_form.png", (req, res) => {
   return res.sendFile("/tmp/create_form.png");
 });
 
-// ---- debug: fill the Service field using typeahead (right panel) and return a screenshot directly ----
+// ---- debug: fill the Service field using typeahead and return a screenshot directly ----
 app.get("/debug/fill_service", async (req, res) => {
   const service = String(req.query.service || "Shape Me Haircut");
 
@@ -592,7 +486,6 @@ app.get("/debug/fill_service", async (req, res) => {
   });
 
   const { context, page } = await getPage(browser);
-
   let step = "start";
 
   try {
@@ -608,13 +501,12 @@ app.get("/debug/fill_service", async (req, res) => {
     });
     await page.waitForTimeout(2500);
 
-    step = "open create (right panel)";
-    const createBtn = page
-      .locator("sbiz-book-right-panel")
-      .locator("sbiz-search-client")
-      .locator('button:has-text("Create")')
+    step = "open create (pink header create)";
+    const headerCreate = page
+      .locator("header.main-header")
+      .locator(':is(button, a, div, span):has-text("Create")')
       .first();
-    await createBtn.click({ timeout: 15000 });
+    await headerCreate.click({ timeout: 15000 });
     await page.waitForTimeout(1200);
 
     step = "find service input";
