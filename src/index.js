@@ -178,32 +178,20 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
     throw new Error("customerName must include first and last name for new client creation");
   }
 
-  const firstNameInput = modal.locator('input[formcontrolname="firstName"]').first();
-  const lastNameInput = modal.locator('input[formcontrolname="lastName"]').first();
-  const mobileInput = modal.locator('input[formcontrolname="telMobile"]').first();
-  const emailInput = modal.locator('input[formcontrolname="email"]').first();
-
-  await setTextInput(firstNameInput, firstName);
-  await setTextInput(lastNameInput, lastName);
-  await setTextInput(mobileInput, customerPhone);
+  await setTextInput(modal.locator('input[formcontrolname="firstName"]').first(), firstName);
+  await setTextInput(modal.locator('input[formcontrolname="lastName"]').first(), lastName);
+  await setTextInput(modal.locator('input[formcontrolname="telMobile"]').first(), customerPhone);
 
   if (customerEmail) {
-    await setTextInput(emailInput, customerEmail);
+    await setTextInput(modal.locator('input[formcontrolname="email"]').first(), customerEmail);
   }
 
-  // Submit modal create
-  const createBtn = modal.locator('button[type="submit"]:has-text("Create")').first();
-  await createBtn.click({ timeout: 15000 });
-
-  // Wait for modal to close
+  await modal.locator('button[type="submit"]:has-text("Create")').first().click({ timeout: 15000 });
   await modal.waitFor({ state: "hidden", timeout: 20000 });
   await page.waitForTimeout(800);
 }
 
 async function clickFinalAppointmentCreate(page) {
-  // The final pink create button for appointment is not in the snippet you pasted
-  // but typically appears after client/service are valid.
-  // We try a set of common selectors within the right panel.
   const panel = page.locator("sbiz-book-right-panel");
 
   const candidates = [
@@ -276,21 +264,71 @@ app.post("/availability", (req, res) => {
   });
 });
 
-// ---- book (automated) ----
+// ---- core booking runner (used by /book and debug routes) ----
+async function runBooking(page, {
+  isNewClient,
+  customerName,
+  customerPhone,
+  customerEmail,
+  service,
+  stylist,
+  startTime,
+  customDuration,
+  requestReason
+}) {
+  await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(2500);
+
+  await ensureCreatePanelOpen(page);
+
+  if (isNewClient) {
+    await clickClientCreateButton(page);
+    await createNewClientInModal(page, { customerName, customerPhone, customerEmail });
+  } else {
+    await selectExistingClient(page, `${customerName} ${customerPhone}`.trim());
+  }
+
+  const panel = page.locator("sbiz-book-right-panel");
+
+  await typeaheadSelect(panel.locator('input[formcontrolname="service"]').first(), service);
+
+  if (stylist) {
+    await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
+  }
+
+  await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
+  await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
+
+  if (requestReason) {
+    await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason);
+  }
+
+  await panel
+    .evaluate((el) => {
+      const scrollable = el.querySelector(".scrollable");
+      if (scrollable) scrollable.scrollTop = scrollable.scrollHeight;
+    })
+    .catch(() => {});
+
+  const clicked = await clickFinalAppointmentCreate(page);
+  return { clickedFinalCreate: clicked };
+}
+
+// ---- book (Vapi tool webhook) ----
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
 
   const {
-    isNewClient, // boolean
+    isNewClient,
     customerName,
     customerPhone,
     customerEmail,
     service,
-    stylist, // optional
-    startTime, // ex "2:30 PM"
-    customDuration, // ex "60" or "60 min" depending on UI
-    requestReason // optional
+    stylist,
+    startTime,
+    customDuration,
+    requestReason
   } = args;
 
   if (typeof isNewClient !== "boolean")
@@ -315,56 +353,22 @@ app.post("/book", async (req, res) => {
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    step = "goto appointmentbook";
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
+    step = "runBooking";
+    const result = await runBooking(page, {
+      isNewClient,
+      customerName,
+      customerPhone,
+      customerEmail,
+      service,
+      stylist,
+      startTime,
+      customDuration,
+      requestReason
     });
-    await page.waitForTimeout(2500);
 
-    step = "open create panel";
-    await ensureCreatePanelOpen(page);
+    await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
 
-    step = "client";
-    if (isNewClient) {
-      await clickClientCreateButton(page);
-      await createNewClientInModal(page, { customerName, customerPhone, customerEmail });
-    } else {
-      // Search by name OR phone; using both increases hit rate
-      await selectExistingClient(page, `${customerName} ${customerPhone}`.trim());
-    }
-
-    const panel = page.locator("sbiz-book-right-panel");
-
-    step = "service";
-    await typeaheadSelect(panel.locator('input[formcontrolname="service"]').first(), service);
-
-    step = "staff (optional)";
-    if (stylist) {
-      await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
-    }
-
-    step = "startTime";
-    await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
-
-    step = "length";
-    await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
-
-    step = "requestReason (optional)";
-    if (requestReason) {
-      await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason);
-    }
-
-    step = "click final appointment create";
-    // Scroll panel bottom just in case the button is lower
-    await panel.evaluate((el) => {
-      const scrollable = el.querySelector(".scrollable");
-      if (scrollable) scrollable.scrollTop = scrollable.scrollHeight;
-    }).catch(() => {});
-
-    const clicked = await clickFinalAppointmentCreate(page);
-    await page.waitForTimeout(1500);
-
-    if (!clicked) {
+    if (!result.clickedFinalCreate) {
       await page.screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true }).catch(() => {});
       return vapiRespond(
         res,
@@ -373,19 +377,16 @@ app.post("/book", async (req, res) => {
           ok: false,
           step,
           error:
-            'Could not find/click the FINAL appointment "Create" button. Open /debug/appt_create_not_found.png and we will add the exact selector.',
+            'Could not find/click the FINAL appointment "Create" button. Open /debug/appt_create_not_found.png.',
           debug: "/debug/appt_create_not_found.png"
         },
         500
       );
     }
 
-    await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
-
     return vapiRespond(res, toolCallId, {
       ok: true,
-      message: "Appointment create click submitted. Verify in SalonBiz.",
-      step,
+      message: "Submitted appointment create. Verify in SalonBiz.",
       debugScreenshot: "/debug/appt_after.png"
     });
   } catch (e) {
@@ -427,28 +428,19 @@ app.get("/debug/click_create", async (req, res) => {
   });
 
   const { context, page } = await getPage(browser);
-  let step = "start";
 
   try {
     if (cookiesExpired()) cookieState = null;
 
-    step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    step = "goto appointmentbook";
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2500);
 
-    step = "screenshot before";
     await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
-
-    step = "click pink create";
     const click = await clickPinkCreateButton(page);
 
-    step = "verify service visible";
     const serviceVisible = await page
       .locator("sbiz-book-right-panel")
       .locator('input[formcontrolname="service"]')
@@ -456,14 +448,12 @@ app.get("/debug/click_create", async (req, res) => {
       .isVisible()
       .catch(() => false);
 
-    step = "screenshot after";
     await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
 
-    return res.status(200).json({ ok: true, click, serviceVisible });
+    return app.response.json.call(res, { ok: true, click, serviceVisible });
   } catch (e) {
-    console.error("DEBUG click_create error at step:", step, e);
     await page.screenshot({ path: "/tmp/create_error.png", fullPage: true }).catch(() => {});
-    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
@@ -482,41 +472,31 @@ app.get("/debug/create_dom", async (req, res) => {
   });
 
   const { context, page } = await getPage(browser);
-  let step = "start";
 
   try {
     if (cookiesExpired()) cookieState = null;
 
-    step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    step = "goto appointmentbook";
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2500);
 
-    step = "open create panel";
     await ensureCreatePanelOpen(page);
 
-    step = "screenshot";
     await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
 
-    step = "extract right panel html";
     const panelHtml = await page
       .locator("sbiz-book-right-panel")
       .evaluate((el) => el.innerHTML);
 
     return res.status(200).json({
       ok: true,
-      step,
       url: page.url(),
       rightPanelHtmlSnippet: String(panelHtml).slice(0, 180000)
     });
   } catch (e) {
-    console.error("DEBUG create_dom error at step:", step, e);
-    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
@@ -533,28 +513,19 @@ app.get("/debug/new_client_dom", async (req, res) => {
   });
 
   const { context, page } = await getPage(browser);
-  let step = "start";
 
   try {
     if (cookiesExpired()) cookieState = null;
 
-    step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    step = "goto appointmentbook";
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-      waitUntil: "domcontentloaded"
-    });
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(2500);
 
-    step = "open create panel";
     await ensureCreatePanelOpen(page);
-
-    step = "click client create";
     await clickClientCreateButton(page);
 
-    step = "screenshot";
     await page.screenshot({ path: "/tmp/new_client.png", fullPage: true });
 
     const modal = page.locator("ngb-modal-window").first();
@@ -563,14 +534,12 @@ app.get("/debug/new_client_dom", async (req, res) => {
 
     return res.status(200).json({
       ok: true,
-      step,
       screenshot: "/debug/new_client.png",
       htmlSnippet: String(html).slice(0, 180000)
     });
   } catch (e) {
-    console.error("DEBUG new_client_dom error at step:", step, e);
     await page.screenshot({ path: "/tmp/new_client_error.png", fullPage: true }).catch(() => {});
-    return res.status(500).json({ ok: false, step, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
@@ -582,6 +551,149 @@ app.get("/debug/new_client_error.png", (req, res) =>
   res.sendFile("/tmp/new_client_error.png")
 );
 
+// ---- NEW: debug runner for existing client booking ----
+app.get("/debug/run_book_existing", async (req, res) => {
+  const customerName = String(req.query.name || "");
+  const customerPhone = String(req.query.phone || "");
+  const service = String(req.query.service || "");
+  const startTime = String(req.query.time || "");
+  const customDuration = String(req.query.length || "");
+  const stylist = req.query.stylist ? String(req.query.stylist) : undefined;
+  const requestReason = req.query.requestReason ? String(req.query.requestReason) : undefined;
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+  const { context, page } = await getPage(browser);
+
+  let step = "start";
+  try {
+    step = "validate";
+    if (!customerName || !customerPhone || !service || !startTime || !customDuration) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Missing required query params: name, phone, service, time, length"
+      });
+    }
+
+    step = "login";
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    step = "runBooking";
+    const result = await runBooking(page, {
+      isNewClient: false,
+      customerName,
+      customerPhone,
+      service,
+      stylist,
+      startTime,
+      customDuration,
+      requestReason
+    });
+
+    await page.screenshot({ path: "/tmp/debug_run_existing.png", fullPage: true }).catch(() => {});
+
+    return res.status(200).json({
+      ok: true,
+      step,
+      result,
+      screenshot: "/debug/debug_run_existing.png"
+    });
+  } catch (e) {
+    await page.screenshot({ path: "/tmp/debug_run_existing_error.png", fullPage: true }).catch(() => {});
+    return res.status(500).json({
+      ok: false,
+      step,
+      error: e?.message || String(e),
+      screenshot: "/debug/debug_run_existing_error.png"
+    });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/debug_run_existing.png", (req, res) =>
+  res.sendFile("/tmp/debug_run_existing.png")
+);
+app.get("/debug/debug_run_existing_error.png", (req, res) =>
+  res.sendFile("/tmp/debug_run_existing_error.png")
+);
+
+// ---- NEW: debug runner for new client booking ----
+app.get("/debug/run_book_new", async (req, res) => {
+  const customerName = String(req.query.name || "");
+  const customerPhone = String(req.query.phone || "");
+  const customerEmail = req.query.email ? String(req.query.email) : undefined;
+  const service = String(req.query.service || "");
+  const startTime = String(req.query.time || "");
+  const customDuration = String(req.query.length || "");
+  const stylist = req.query.stylist ? String(req.query.stylist) : undefined;
+  const requestReason = req.query.requestReason ? String(req.query.requestReason) : undefined;
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+  const { context, page } = await getPage(browser);
+
+  let step = "start";
+  try {
+    step = "validate";
+    if (!customerName || !customerPhone || !service || !startTime || !customDuration) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Missing required query params: name, phone, service, time, length"
+      });
+    }
+
+    step = "login";
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    step = "runBooking";
+    const result = await runBooking(page, {
+      isNewClient: true,
+      customerName,
+      customerPhone,
+      customerEmail,
+      service,
+      stylist,
+      startTime,
+      customDuration,
+      requestReason
+    });
+
+    await page.screenshot({ path: "/tmp/debug_run_new.png", fullPage: true }).catch(() => {});
+
+    return res.status(200).json({
+      ok: true,
+      step,
+      result,
+      screenshot: "/debug/debug_run_new.png"
+    });
+  } catch (e) {
+    await page.screenshot({ path: "/tmp/debug_run_new_error.png", fullPage: true }).catch(() => {});
+    return res.status(500).json({
+      ok: false,
+      step,
+      error: e?.message || String(e),
+      screenshot: "/debug/debug_run_new_error.png"
+    });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/debug_run_new.png", (req, res) => res.sendFile("/tmp/debug_run_new.png"));
+app.get("/debug/debug_run_new_error.png", (req, res) =>
+  res.sendFile("/tmp/debug_run_new_error.png")
+);
+
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
-});
