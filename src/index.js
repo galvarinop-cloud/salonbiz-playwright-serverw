@@ -2,7 +2,7 @@ import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -74,26 +74,34 @@ async function loginIfNeeded(page) {
  * Vapi Function tool webhooks must respond with:
  * { results: [{ toolCallId, result }] }
  */
-function getToolCallInfo(req) {
-  const toolCall =
+function extractToolCall(req) {
+  return (
     req.body?.message?.toolCallList?.[0] ||
     req.body?.message?.toolCalls?.[0] ||
-    null;
+    null
+  );
+}
 
-  const toolCallId = toolCall?.id || null;
+function extractToolCallId(req) {
+  const toolCall = extractToolCall(req);
+  return toolCall?.id || null;
+}
 
+function extractArgs(req) {
+  const toolCall = extractToolCall(req);
   let args = {};
+
   try {
-    const rawArgs = toolCall?.function?.arguments;
-    args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs || {};
+    const raw = toolCall?.function?.arguments;
+    args = typeof raw === "string" ? JSON.parse(raw) : raw || {};
   } catch {
     args = {};
   }
 
-  return { toolCallId, args };
+  return args;
 }
 
-function vapiResult(res, toolCallId, result, statusCode = 200) {
+function vapiRespond(res, toolCallId, result, statusCode = 200) {
   return res.status(statusCode).json({
     results: [
       {
@@ -105,7 +113,7 @@ function vapiResult(res, toolCallId, result, statusCode = 200) {
 }
 
 function vapiError(res, toolCallId, message, statusCode = 400) {
-  return vapiResult(res, toolCallId, { ok: false, error: message }, statusCode);
+  return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
 app.get("/health", async (req, res) => {
@@ -113,21 +121,28 @@ app.get("/health", async (req, res) => {
 });
 
 /**
- * Availability tool: Amare-Hair-salon-Check-Availability
- * Expects args: { bookingDateAndTime: "YYYY-MM-DDTHH:mm:ss" }
+ * Availability tool endpoint for:
+ * Amare-Hair-salon-Check-Availability
+ *
+ * IMPORTANT: This must not throw, and must always return { results: [...] }.
  */
 app.post("/availability", (req, res) => {
-  const { toolCallId, args } = getToolCallInfo(req);
+  // Log full webhook body so we can verify the exact shape
+  console.log("AVAILABILITY WEBHOOK BODY:", JSON.stringify(req.body));
+
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
 
   const bookingDateAndTime =
-    args.bookingDateAndTime || req.body?.bookingDateAndTime;
+    args.bookingDateAndTime || req.body?.bookingDateAndTime || null;
 
   if (!bookingDateAndTime) {
+    // Still respond in Vapi format
     return vapiError(res, toolCallId, "bookingDateAndTime required");
   }
 
-  // For now, always return available
-  return vapiResult(res, toolCallId, {
+  // For now: always available
+  return vapiRespond(res, toolCallId, {
     ok: true,
     available: true,
     bookingDateAndTime
@@ -135,12 +150,13 @@ app.post("/availability", (req, res) => {
 });
 
 /**
- * Booking tool: salonbiz_book_appointment
- * Expects Vapi args:
+ * Booking endpoint for salonbiz_book_appointment
+ * Expects args:
  * { customerName, customerPhone, service, stylist, date, time, timezone, notes?, email? }
  */
 app.post("/book", async (req, res) => {
-  const { toolCallId, args } = getToolCallInfo(req);
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
 
   const {
     customerName,
@@ -178,7 +194,6 @@ app.post("/book", async (req, res) => {
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
-
   const { context, page } = await getPage(browser);
 
   try {
@@ -187,9 +202,8 @@ app.post("/book", async (req, res) => {
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    // TODO: implement real booking selectors.
-    // For now, return a successful-shaped response so the assistant flow works.
-    return vapiResult(res, toolCallId, {
+    // TODO: implement real booking selectors
+    return vapiRespond(res, toolCallId, {
       ok: true,
       status: "received",
       message:
@@ -205,7 +219,7 @@ app.post("/book", async (req, res) => {
       }
     });
   } catch (e) {
-    return vapiResult(
+    return vapiRespond(
       res,
       toolCallId,
       { ok: false, error: e?.message || String(e) },
@@ -218,12 +232,13 @@ app.post("/book", async (req, res) => {
 });
 
 /**
- * Cancel tool: salonbiz_cancel_appointment
- * Expects Vapi args:
+ * Cancel endpoint for salonbiz_cancel_appointment
+ * Expects args:
  * { customerName, customerPhone?, date, time, timezone, notes?, confirmationRequired }
  */
 app.post("/cancel", async (req, res) => {
-  const { toolCallId, args } = getToolCallInfo(req);
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
 
   const {
     customerName,
@@ -249,7 +264,6 @@ app.post("/cancel", async (req, res) => {
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
-
   const { context, page } = await getPage(browser);
 
   try {
@@ -258,8 +272,8 @@ app.post("/cancel", async (req, res) => {
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    // TODO: implement real cancel selectors.
-    return vapiResult(res, toolCallId, {
+    // TODO: implement real cancel selectors
+    return vapiRespond(res, toolCallId, {
       ok: true,
       status: "received",
       message:
@@ -273,7 +287,7 @@ app.post("/cancel", async (req, res) => {
       }
     });
   } catch (e) {
-    return vapiResult(
+    return vapiRespond(
       res,
       toolCallId,
       { ok: false, error: e?.message || String(e) },
