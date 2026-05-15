@@ -32,6 +32,16 @@ function cookiesExpired() {
   return !cookieState || Date.now() - cookieStateSetAt > COOKIE_TTL_MS;
 }
 
+function digitsOnly(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+function formatUsPhoneMaybe(phone) {
+  const d = digitsOnly(phone);
+  if (d.length === 10) return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`;
+  return String(phone || "");
+}
+
 async function getPage(browser) {
   const context = await browser.newContext(
     cookieState ? { storageState: cookieState } : undefined
@@ -179,9 +189,11 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
     throw new Error("customerName must include first + last name for new client creation");
   }
 
+  const phoneFormatted = formatUsPhoneMaybe(customerPhone);
+
   await setTextInput(modal.locator('input[formcontrolname="firstName"]').first(), firstName);
   await setTextInput(modal.locator('input[formcontrolname="lastName"]').first(), lastName);
-  await setTextInput(modal.locator('input[formcontrolname="telMobile"]').first(), customerPhone);
+  await setTextInput(modal.locator('input[formcontrolname="telMobile"]').first(), phoneFormatted);
 
   if (customerEmail) {
     await setTextInput(modal.locator('input[formcontrolname="email"]').first(), customerEmail);
@@ -191,6 +203,18 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
     .locator('button[type="submit"]:has-text("Create")')
     .first()
     .click({ timeout: 15000 });
+
+  // If it doesn't close, capture the footer alert
+  await page.waitForTimeout(1500);
+
+  const stillVisible = await modal.isVisible().catch(() => false);
+  if (stillVisible) {
+    const alertText = await modal.locator(".sbiz-alert").innerText().catch(() => "");
+    await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
+    throw new Error(
+      `New client modal did not close. SalonBiz error: ${alertText || "(no alert text found)"}`
+    );
+  }
 
   await modal.waitFor({ state: "hidden", timeout: 20000 });
   await page.waitForTimeout(800);
@@ -400,7 +424,7 @@ app.post("/book", async (req, res) => {
     return vapiRespond(
       res,
       toolCallId,
-      { ok: false, step, error: e?.message || String(e), debugScreenshot: "/debug/book_error.png" },
+      { ok: false, step, error: e?.message || String(e) },
       500
     );
   } finally {
@@ -414,6 +438,9 @@ app.get("/debug/appt_create_not_found.png", (req, res) =>
   res.sendFile("/tmp/appt_create_not_found.png")
 );
 app.get("/debug/book_error.png", (req, res) => res.sendFile("/tmp/book_error.png"));
+app.get("/debug/new_client_submit_failed.png", (req, res) =>
+  res.sendFile("/tmp/new_client_submit_failed.png")
+);
 
 // ---- cancel (stub) ----
 app.post("/cancel", async (req, res) => {
@@ -424,137 +451,6 @@ app.post("/cancel", async (req, res) => {
     message: "Cancel not implemented yet."
   });
 });
-
-// ---- debug: click create ----
-app.get("/debug/click_create", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(2500);
-
-    await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
-    const click = await clickPinkCreateButton(page);
-
-    const serviceVisible = await page
-      .locator("sbiz-book-right-panel")
-      .locator('input[formcontrolname="service"]')
-      .first()
-      .isVisible()
-      .catch(() => false);
-
-    await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
-
-    return res.status(200).json({ ok: true, click, serviceVisible });
-  } catch (e) {
-    await page.screenshot({ path: "/tmp/create_error.png", fullPage: true }).catch(() => {});
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/create_before.png", (req, res) => res.sendFile("/tmp/create_before.png"));
-app.get("/debug/create_after.png", (req, res) => res.sendFile("/tmp/create_after.png"));
-app.get("/debug/create_error.png", (req, res) => res.sendFile("/tmp/create_error.png"));
-
-// ---- debug: dump right panel DOM ----
-app.get("/debug/create_dom", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(2500);
-
-    await ensureCreatePanelOpen(page);
-
-    await page.screenshot({ path: "/tmp/create_form.png", fullPage: true });
-
-    const panelHtml = await page
-      .locator("sbiz-book-right-panel")
-      .evaluate((el) => el.innerHTML);
-
-    return res.status(200).json({
-      ok: true,
-      url: page.url(),
-      rightPanelHtmlSnippet: String(panelHtml).slice(0, 180000)
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/create_form.png", (req, res) => res.sendFile("/tmp/create_form.png"));
-
-// ---- debug: capture new client modal DOM ----
-app.get("/debug/new_client_dom", async (req, res) => {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-
-  const { context, page } = await getPage(browser);
-
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(2500);
-
-    await ensureCreatePanelOpen(page);
-    await clickClientCreateButton(page);
-
-    await page.screenshot({ path: "/tmp/new_client.png", fullPage: true });
-
-    const modal = page.locator("ngb-modal-window").first();
-    await modal.waitFor({ state: "visible", timeout: 15000 });
-    const html = await modal.evaluate((el) => el.innerHTML);
-
-    return res.status(200).json({
-      ok: true,
-      screenshot: "/debug/new_client.png",
-      htmlSnippet: String(html).slice(0, 180000)
-    });
-  } catch (e) {
-    await page.screenshot({ path: "/tmp/new_client_error.png", fullPage: true }).catch(() => {});
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/new_client.png", (req, res) => res.sendFile("/tmp/new_client.png"));
-app.get("/debug/new_client_error.png", (req, res) =>
-  res.sendFile("/tmp/new_client_error.png")
-);
 
 // ---- debug runner (existing client) ----
 app.get("/debug/run_book_existing", async (req, res) => {
