@@ -613,7 +613,7 @@ app.get("/debug/create_form.png", (req, res) => {
   return res.sendFile("/tmp/create_form.png");
 });
 
-// ---- debug: fill the Service field using typeahead and screenshot ----
+// ---- debug: fill the Service field using typeahead and return a screenshot directly ----
 app.get("/debug/fill_service", async (req, res) => {
   const service = String(req.query.service || "Haircut");
 
@@ -624,60 +624,63 @@ app.get("/debug/fill_service", async (req, res) => {
 
   const { context, page } = await getPage(browser);
 
+  let step = "start";
+
   try {
     if (cookiesExpired()) cookieState = null;
 
+    step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
 
+    step = "goto appointmentbook";
     await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
       waitUntil: "domcontentloaded"
     });
     await page.waitForTimeout(2500);
 
-    // Open Create
+    step = "open create";
     const createBtn = page
-      .locator('button:has-text("Create"), button:has-text("New"), button:has-text("Add")')
+      .locator(
+        'button:has-text("Create"), button:has-text("New"), button:has-text("Add")'
+      )
       .first();
     await createBtn.click({ timeout: 10000 });
     await page.waitForTimeout(2000);
 
-    // Try to find the Service input by placeholder/aria-label
+    step = "find service input";
     const serviceInput = page
       .locator('input[placeholder*="Service" i], input[aria-label*="Service" i]')
       .first();
 
     await serviceInput.waitFor({ state: "visible", timeout: 15000 });
+
+    step = "type service";
     await serviceInput.click();
     await serviceInput.fill("");
     await serviceInput.type(service, { delay: 40 });
 
-    // Wait for suggestions
+    step = "select suggestion";
     await page.waitForTimeout(800);
-
-    // Choose first suggestion
     await page.keyboard.press("ArrowDown");
     await page.keyboard.press("Enter");
 
-    await page.waitForTimeout(800);
-    await page.screenshot({ path: "/tmp/fill_service.png", fullPage: true });
+    step = "screenshot";
+    const buf = await page.screenshot({ fullPage: true });
 
-    return res.status(200).json({
-      ok: true,
-      message: "Filled service. Open /debug/fill_service.png to verify.",
-      service
-    });
+    res.setHeader("Content-Type", "image/png");
+    return res.status(200).send(buf);
   } catch (e) {
-    console.error("DEBUG /debug/fill_service error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    console.error("DEBUG /debug/fill_service error at step:", step, e);
+    return res.status(500).json({
+      ok: false,
+      step,
+      error: e?.message || String(e)
+    });
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
-});
-
-app.get("/debug/fill_service.png", (req, res) => {
-  return res.sendFile("/tmp/fill_service.png");
 });
 
 app.listen(PORT, () => {
