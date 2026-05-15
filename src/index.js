@@ -16,7 +16,7 @@ const SALONBIZ_BASE_URL =
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
 const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 
-// Click tuning via env vars (working values from your tests)
+// Working values from your tests
 const CREATE_CLICK_X_PCT = Number(process.env.CREATE_CLICK_X_PCT || 0.95);
 const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
 
@@ -64,7 +64,6 @@ async function loginIfNeeded(page) {
   const passSel = 'input[formcontrolname="password"]';
   const submitSel = 'button[type="submit"]';
 
-  // If already logged in, password field won't exist
   if ((await page.locator(passSel).count()) === 0) return;
 
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
@@ -128,7 +127,7 @@ async function typeaheadSelect(inputLocator, value) {
   await inputLocator.click({ timeout: 15000 });
   await inputLocator.fill("");
   await inputLocator.type(String(value), { delay: 35 });
-  await inputLocator.page().waitForTimeout(600);
+  await inputLocator.page().waitForTimeout(700);
   await inputLocator.page().keyboard.press("ArrowDown");
   await inputLocator.page().keyboard.press("Enter");
 }
@@ -138,11 +137,16 @@ async function setTextInput(inputLocator, value) {
   await inputLocator.fill(String(value));
 }
 
-/**
- * Select existing client:
- * - Types into the Client search box (placeholder "Search by name or contact")
- * - ArrowDown + Enter to pick the first suggestion
- */
+function splitName(full) {
+  const parts = String(full || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const firstName = parts[0] || "";
+  const lastName = parts.slice(1).join(" ") || "";
+  return { firstName, lastName };
+}
+
 async function selectExistingClient(page, query) {
   const clientSearch = page
     .locator("sbiz-book-right-panel")
@@ -153,10 +157,6 @@ async function selectExistingClient(page, query) {
   await typeaheadSelect(clientSearch, query);
 }
 
-/**
- * Click the "Create" button next to the client search (to create a new client).
- * This opens a modal/panel we need to inspect and then automate.
- */
 async function clickClientCreateButton(page) {
   const btn = page
     .locator("sbiz-book-right-panel")
@@ -167,6 +167,64 @@ async function clickClientCreateButton(page) {
   await btn.waitFor({ state: "visible", timeout: 15000 });
   await btn.click({ timeout: 15000 });
   await page.waitForTimeout(1200);
+}
+
+async function createNewClientInModal(page, { customerName, customerPhone, customerEmail }) {
+  const modal = page.locator("ngb-modal-window").first();
+  await modal.waitFor({ state: "visible", timeout: 20000 });
+
+  const { firstName, lastName } = splitName(customerName);
+  if (!firstName || !lastName) {
+    throw new Error("customerName must include first and last name for new client creation");
+  }
+
+  const firstNameInput = modal.locator('input[formcontrolname="firstName"]').first();
+  const lastNameInput = modal.locator('input[formcontrolname="lastName"]').first();
+  const mobileInput = modal.locator('input[formcontrolname="telMobile"]').first();
+  const emailInput = modal.locator('input[formcontrolname="email"]').first();
+
+  await setTextInput(firstNameInput, firstName);
+  await setTextInput(lastNameInput, lastName);
+  await setTextInput(mobileInput, customerPhone);
+
+  if (customerEmail) {
+    await setTextInput(emailInput, customerEmail);
+  }
+
+  // Submit modal create
+  const createBtn = modal.locator('button[type="submit"]:has-text("Create")').first();
+  await createBtn.click({ timeout: 15000 });
+
+  // Wait for modal to close
+  await modal.waitFor({ state: "hidden", timeout: 20000 });
+  await page.waitForTimeout(800);
+}
+
+async function clickFinalAppointmentCreate(page) {
+  // The final pink create button for appointment is not in the snippet you pasted
+  // but typically appears after client/service are valid.
+  // We try a set of common selectors within the right panel.
+  const panel = page.locator("sbiz-book-right-panel");
+
+  const candidates = [
+    panel.locator('.sbiz-btn--primary:has-text("Create")'),
+    panel.locator('button.sbiz-btn--primary:has-text("Create")'),
+    panel.locator('button[type="submit"]:has-text("Create")'),
+    panel.locator('button:has-text("Create")')
+  ];
+
+  for (const loc of candidates) {
+    const count = await loc.count().catch(() => 0);
+    if (count > 0) {
+      const btn = loc.last();
+      const visible = await btn.isVisible().catch(() => false);
+      if (visible) {
+        await btn.click({ timeout: 15000 });
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 // ---- Vapi webhook helpers ----
@@ -218,29 +276,30 @@ app.post("/availability", (req, res) => {
   });
 });
 
-// ---- book (still WIP; will be upgraded after we map New Client DOM) ----
+// ---- book (automated) ----
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
 
   const {
-    isNewClient,
+    isNewClient, // boolean
     customerName,
     customerPhone,
     customerEmail,
     service,
-    stylist,
-    startTime, // ex: "2:30 PM" (SalonBiz startTime field seems to accept this)
-    customDuration, // ex: "60"
-    requestReason,
-    notes
+    stylist, // optional
+    startTime, // ex "2:30 PM"
+    customDuration, // ex "60" or "60 min" depending on UI
+    requestReason // optional
   } = args;
 
-  if (isNewClient == null)
-    return vapiError(res, toolCallId, "isNewClient required (true/false)");
+  if (typeof isNewClient !== "boolean")
+    return vapiError(res, toolCallId, "isNewClient required (true/false boolean)");
   if (!customerName) return vapiError(res, toolCallId, "customerName required");
   if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
   if (!service) return vapiError(res, toolCallId, "service required");
+  if (!startTime) return vapiError(res, toolCallId, "startTime required (ex: 2:30 PM)");
+  if (!customDuration) return vapiError(res, toolCallId, "customDuration required (ex: 60)");
 
   const browser = await chromium.launch({
     headless: true,
@@ -267,87 +326,67 @@ app.post("/book", async (req, res) => {
 
     step = "client";
     if (isNewClient) {
-      // We will implement this after we inspect the new-client DOM
       await clickClientCreateButton(page);
-
-      await page.screenshot({ path: "/tmp/new_client_opened.png", fullPage: true }).catch(() => {});
-      return vapiRespond(res, toolCallId, {
-        ok: false,
-        step,
-        status: "needs_new_client_dom",
-        message:
-          "New client creation flow opened, but not automated yet. Run /debug/new_client_dom to capture selectors.",
-        debugScreenshot: "/tmp/new_client_opened.png"
-      });
+      await createNewClientInModal(page, { customerName, customerPhone, customerEmail });
     } else {
-      // Existing client: search by name or phone (we’ll use name + phone)
-      const query = `${customerName} ${customerPhone}`.trim();
-      await selectExistingClient(page, query);
+      // Search by name OR phone; using both increases hit rate
+      await selectExistingClient(page, `${customerName} ${customerPhone}`.trim());
     }
 
-    step = "fill service";
-    const serviceInput = page
-      .locator("sbiz-book-right-panel")
-      .locator('input[formcontrolname="service"]')
-      .first();
-    await typeaheadSelect(serviceInput, service);
+    const panel = page.locator("sbiz-book-right-panel");
 
-    step = "fill staff (optional)";
+    step = "service";
+    await typeaheadSelect(panel.locator('input[formcontrolname="service"]').first(), service);
+
+    step = "staff (optional)";
     if (stylist) {
-      const staffInput = page
-        .locator("sbiz-book-right-panel")
-        .locator('input[formcontrolname="staff"]')
-        .first();
-      await typeaheadSelect(staffInput, stylist);
+      await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
     }
 
-    step = "fill startTime (optional)";
-    if (startTime) {
-      const startInput = page
-        .locator("sbiz-book-right-panel")
-        .locator('input[formcontrolname="startTime"]')
-        .first();
-      await setTextInput(startInput, startTime);
-    }
+    step = "startTime";
+    await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
 
-    step = "fill customDuration (optional)";
-    if (customDuration) {
-      const durInput = page
-        .locator("sbiz-book-right-panel")
-        .locator('input[formcontrolname="customDuration"]')
-        .first();
-      await setTextInput(durInput, customDuration);
-    }
+    step = "length";
+    await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
 
-    step = "fill requestReason (optional)";
+    step = "requestReason (optional)";
     if (requestReason) {
-      const reqInput = page
-        .locator("sbiz-book-right-panel")
-        .locator('input[formcontrolname="requestReason"]')
-        .first();
-      await setTextInput(reqInput, requestReason);
+      await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason);
     }
 
-    // Notes isn't in snippet yet; likely below. We'll handle after we confirm.
-    if (notes) {
-      const notesInput = page
-        .locator("sbiz-book-right-panel")
-        .locator('textarea[formcontrolname="notes"], textarea')
-        .first();
-      if ((await notesInput.count().catch(() => 0)) > 0) {
-        await setTextInput(notesInput, notes);
-      }
+    step = "click final appointment create";
+    // Scroll panel bottom just in case the button is lower
+    await panel.evaluate((el) => {
+      const scrollable = el.querySelector(".scrollable");
+      if (scrollable) scrollable.scrollTop = scrollable.scrollHeight;
+    }).catch(() => {});
+
+    const clicked = await clickFinalAppointmentCreate(page);
+    await page.waitForTimeout(1500);
+
+    if (!clicked) {
+      await page.screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true }).catch(() => {});
+      return vapiRespond(
+        res,
+        toolCallId,
+        {
+          ok: false,
+          step,
+          error:
+            'Could not find/click the FINAL appointment "Create" button. Open /debug/appt_create_not_found.png and we will add the exact selector.',
+          debug: "/debug/appt_create_not_found.png"
+        },
+        500
+      );
     }
 
-    await page.screenshot({ path: "/tmp/book_filled.png", fullPage: true }).catch(() => {});
+    await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
 
     return vapiRespond(res, toolCallId, {
       ok: true,
+      message: "Appointment create click submitted. Verify in SalonBiz.",
       step,
-      status: "filled_fields_only",
-      message:
-        "Filled client/service/staff/time/length fields. Next step is clicking the final pink Create button and handling notes/confirmation.",
-      debugScreenshot: "/tmp/book_filled.png"
+      debugScreenshot: "/debug/appt_after.png"
     });
   } catch (e) {
     console.error("BOOK error at step:", step, e);
@@ -355,7 +394,7 @@ app.post("/book", async (req, res) => {
     return vapiRespond(
       res,
       toolCallId,
-      { ok: false, step, error: e?.message || String(e) },
+      { ok: false, step, error: e?.message || String(e), debugScreenshot: "/debug/book_error.png" },
       500
     );
   } finally {
@@ -363,6 +402,12 @@ app.post("/book", async (req, res) => {
     await browser.close().catch(() => {});
   }
 });
+
+app.get("/debug/appt_after.png", (req, res) => res.sendFile("/tmp/appt_after.png"));
+app.get("/debug/appt_create_not_found.png", (req, res) =>
+  res.sendFile("/tmp/appt_create_not_found.png")
+);
+app.get("/debug/book_error.png", (req, res) => res.sendFile("/tmp/book_error.png"));
 
 // ---- cancel (stub) ----
 app.post("/cancel", async (req, res) => {
@@ -429,7 +474,7 @@ app.get("/debug/create_before.png", (req, res) => res.sendFile("/tmp/create_befo
 app.get("/debug/create_after.png", (req, res) => res.sendFile("/tmp/create_after.png"));
 app.get("/debug/create_error.png", (req, res) => res.sendFile("/tmp/create_error.png"));
 
-// ---- debug: dump right panel DOM (already working) ----
+// ---- debug: dump right panel DOM ----
 app.get("/debug/create_dom", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -480,13 +525,7 @@ app.get("/debug/create_dom", async (req, res) => {
 
 app.get("/debug/create_form.png", (req, res) => res.sendFile("/tmp/create_form.png"));
 
-/**
- * NEW: debug route to capture NEW CLIENT modal/panel DOM.
- * Steps:
- * 1) open create panel
- * 2) click Client -> Create
- * 3) screenshot + return HTML of whichever container popped up
- */
+// ---- debug: capture new client modal DOM ----
 app.get("/debug/new_client_dom", async (req, res) => {
   const browser = await chromium.launch({
     headless: true,
@@ -518,35 +557,15 @@ app.get("/debug/new_client_dom", async (req, res) => {
     step = "screenshot";
     await page.screenshot({ path: "/tmp/new_client.png", fullPage: true });
 
-    // Common patterns for modals in Angular apps:
-    const modalCandidates = [
-      page.locator("ngb-modal-window").first(),
-      page.locator(".modal").first(),
-      page.locator(".cdk-overlay-container").first(),
-      page.locator("sbiz-book-right-panel").first() // fallback
-    ];
-
-    let html = null;
-    let matched = null;
-
-    for (const loc of modalCandidates) {
-      const count = await loc.count().catch(() => 0);
-      if (count > 0) {
-        const visible = await loc.isVisible().catch(() => false);
-        if (visible) {
-          html = await loc.evaluate((el) => el.innerHTML);
-          matched = await loc.evaluate((el) => el.tagName + (el.className ? `.${el.className}` : ""));
-          break;
-        }
-      }
-    }
+    const modal = page.locator("ngb-modal-window").first();
+    await modal.waitFor({ state: "visible", timeout: 15000 });
+    const html = await modal.evaluate((el) => el.innerHTML);
 
     return res.status(200).json({
       ok: true,
       step,
-      matchedContainer: matched,
       screenshot: "/debug/new_client.png",
-      htmlSnippet: (html || "").slice(0, 180000)
+      htmlSnippet: String(html).slice(0, 180000)
     });
   } catch (e) {
     console.error("DEBUG new_client_dom error at step:", step, e);
