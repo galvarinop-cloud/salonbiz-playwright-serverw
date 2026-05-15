@@ -140,6 +140,31 @@ app.post("/cancel", async (req, res) => {
   }
 });
 
+app.get("/debug/screenshot", async (req, res) => {
+  const browser = await chromium.launch({ headless: true });
+  const { context, page } = await getPage(browser);
+
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "networkidle"
+    });
+
+    const buf = await page.screenshot({ fullPage: true });
+    res.setHeader("Content-Type", "image/png");
+    return res.status(200).send(buf);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
 });
