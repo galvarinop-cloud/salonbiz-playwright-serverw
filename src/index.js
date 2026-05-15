@@ -229,7 +229,7 @@ app.post("/book", async (req, res) => {
       ok: false,
       status: "not_implemented",
       message:
-        "Booking automation not implemented yet. Login works; next step is calendar interaction + booking selectors.",
+        "Booking automation not implemented yet. Login works; next step is clicking Create and driving the create-appointment UI.",
       mapped: {
         client: { firstName, lastName, phone: customerPhone || "" },
         serviceName: service,
@@ -506,6 +506,60 @@ app.get("/debug/slot_before.png", (req, res) => {
 
 app.get("/debug/slot_after.png", (req, res) => {
   return res.sendFile("/tmp/slot_after.png");
+});
+
+// ---- debug: click Create button and screenshot before/after ----
+app.get("/debug/click_create", async (req, res) => {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+
+  const { context, page } = await getPage(browser);
+
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded"
+    });
+
+    await page.waitForTimeout(2500);
+    await page.screenshot({ path: "/tmp/create_before.png", fullPage: true });
+
+    // Try the Create button (robust text match)
+    const createBtn = page
+      .locator('button:has-text("Create"), button:has-text("New"), button:has-text("Add")')
+      .first();
+
+    await createBtn.click({ timeout: 10000 });
+
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: "/tmp/create_after.png", fullPage: true });
+
+    return res.status(200).json({
+      ok: true,
+      message:
+        "Saved /tmp/create_before.png and /tmp/create_after.png. Open /debug/create_before.png and /debug/create_after.png"
+    });
+  } catch (e) {
+    console.error("DEBUG /debug/click_create error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+app.get("/debug/create_before.png", (req, res) => {
+  return res.sendFile("/tmp/create_before.png");
+});
+
+app.get("/debug/create_after.png", (req, res) => {
+  return res.sendFile("/tmp/create_after.png");
 });
 
 app.listen(PORT, () => {
