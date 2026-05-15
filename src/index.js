@@ -72,6 +72,16 @@ app.get("/health", async (req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
+app.post("/availability", (req, res) => {
+  const { bookingDateAndTime } = req.body || {};
+  return res.json({
+    ok: true,
+    available: true,
+    bookingDateAndTime
+  });
+});
+
+});
 app.post("/book", async (req, res) => {
   const body = req.body || {};
 
