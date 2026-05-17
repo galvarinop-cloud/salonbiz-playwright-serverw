@@ -16,7 +16,7 @@ const SALONBIZ_BASE_URL =
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
 const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 
-// Working values from your tests
+// If you use the pink create button click-by-percentage trick:
 const CREATE_CLICK_X_PCT = Number(process.env.CREATE_CLICK_X_PCT || 0.95);
 const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
 
@@ -42,6 +42,16 @@ function formatUsPhoneMaybe(phone) {
   return String(phone || "");
 }
 
+function normalizeEmail(raw) {
+  if (!raw) return "";
+  return String(raw)
+    .trim()
+    .replace(/\s+/g, "") // remove spaces
+    .replace(/\(at\)|\sat\s/gi, "@")
+    .replace(/\s?dot\s?/gi, ".")
+    .toLowerCase();
+}
+
 async function getPage(browser) {
   const context = await browser.newContext(
     cookieState ? { storageState: cookieState } : undefined
@@ -58,14 +68,14 @@ async function saveCookies(context) {
 }
 
 /**
- * SalonBiz login (Angular-friendly).
+ * SalonBiz login
  */
 async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
 
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
-    waitUntil: "domcontentloaded"
+    waitUntil: "domcontentloaded",
   });
 
   await page.waitForTimeout(2000);
@@ -74,7 +84,7 @@ async function loginIfNeeded(page) {
   const passSel = 'input[formcontrolname="password"]';
   const submitSel = 'button[type="submit"]';
 
-  // Already logged in
+  // already logged in
   if ((await page.locator(passSel).count()) === 0) return;
 
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
@@ -103,7 +113,7 @@ async function loginIfNeeded(page) {
       userSel,
       passSel,
       username: String(SALONBIZ_USERNAME),
-      password: String(SALONBIZ_PASSWORD)
+      password: String(SALONBIZ_PASSWORD),
     }
   );
 
@@ -117,7 +127,6 @@ async function clickPinkCreateButton(page) {
   const y = Math.floor(vp.height * CREATE_CLICK_Y_PCT);
   await page.mouse.click(x, y);
   await page.waitForTimeout(1200);
-  return { x, y, vp, xPct: CREATE_CLICK_X_PCT, yPct: CREATE_CLICK_Y_PCT };
 }
 
 async function ensureCreatePanelOpen(page) {
@@ -190,20 +199,18 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
   }
 
   const phoneFormatted = formatUsPhoneMaybe(customerPhone);
+  const emailNormalized = normalizeEmail(customerEmail);
 
   await setTextInput(modal.locator('input[formcontrolname="firstName"]').first(), firstName);
   await setTextInput(modal.locator('input[formcontrolname="lastName"]').first(), lastName);
   await setTextInput(modal.locator('input[formcontrolname="telMobile"]').first(), phoneFormatted);
-
-  // Required (per your decision)
-  await setTextInput(modal.locator('input[formcontrolname="email"]').first(), customerEmail);
+  await setTextInput(modal.locator('input[formcontrolname="email"]').first(), emailNormalized);
 
   await modal
     .locator('button[type="submit"]:has-text("Create")')
     .first()
     .click({ timeout: 15000 });
 
-  // Give UI time to validate/close
   await page.waitForTimeout(1500);
 
   const stillVisible = await modal.isVisible().catch(() => false);
@@ -226,7 +233,7 @@ async function clickFinalAppointmentCreate(page) {
     panel.locator('.sbiz-btn--primary:has-text("Create")'),
     panel.locator('button.sbiz-btn--primary:has-text("Create")'),
     panel.locator('button[type="submit"]:has-text("Create")'),
-    panel.locator('button:has-text("Create")')
+    panel.locator('button:has-text("Create")'),
   ];
 
   for (const loc of candidates) {
@@ -243,7 +250,7 @@ async function clickFinalAppointmentCreate(page) {
   return false;
 }
 
-// ---- Vapi webhook helpers ----
+// -------------------- Vapi tool webhook helpers --------------------
 function extractToolCall(req) {
   return (
     req.body?.message?.toolCallList?.[0] ||
@@ -251,10 +258,12 @@ function extractToolCall(req) {
     null
   );
 }
+
 function extractToolCallId(req) {
   const toolCall = extractToolCall(req);
   return toolCall?.id || null;
 }
+
 function extractArgs(req) {
   const toolCall = extractToolCall(req);
   const raw = toolCall?.function?.arguments;
@@ -269,30 +278,36 @@ function extractArgs(req) {
   }
   return {};
 }
+
+/** IMPORTANT: Always respond with this wrapper */
 function vapiRespond(res, toolCallId, result, statusCode = 200) {
   return res.status(statusCode).json({ results: [{ toolCallId, result }] });
 }
+
 function vapiError(res, toolCallId, message, statusCode = 400) {
   return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
-// ---- health ----
+// -------------------- routes --------------------
 app.get("/health", (req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
-// ---- availability (stub) ----
+app.get("/debug/ping", (req, res) => {
+  res.json({ ok: true, msg: "pong" });
+});
+
+// Availability stub
 app.post("/availability", (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
   return vapiRespond(res, toolCallId, {
     ok: true,
     available: true,
-    bookingDateAndTime: args?.bookingDateAndTime || null
+    bookingDateAndTime: args?.bookingDateAndTime || null,
   });
 });
 
-// ---- core booking runner ----
 async function runBooking(page, {
   isNewClient,
   customerName,
@@ -302,7 +317,7 @@ async function runBooking(page, {
   stylist,
   startTime,
   customDuration,
-  requestReason
+  requestReason,
 }) {
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(2500);
@@ -342,37 +357,40 @@ async function runBooking(page, {
   return { clickedFinalCreate: clicked };
 }
 
-// ---- book (Vapi tool webhook) ----
+/**
+ * Vapi tool webhook: /book
+ * This MUST return { results: [...] }.
+ */
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
 
-  const {
-    isNewClient,
-    customerName,
-    customerPhone,
-    customerEmail,
-    service,
-    stylist,
-    startTime,
-    customDuration,
-    requestReason
-  } = args;
+  // Normalize args (handle both old/new schemas)
+  const isNewClient = Boolean(args.isNewClient);
+  const customerName = args.customerName || args.name || "";
+  const customerPhone = args.customerPhone || args.phone || "";
+  const customerEmailRaw = args.customerEmail || args.email || "";
+  const customerEmail = normalizeEmail(customerEmailRaw);
 
-  if (typeof isNewClient !== "boolean")
-    return vapiError(res, toolCallId, "isNewClient required (true/false boolean)");
+  const service = args.service || "";
+  const stylist = args.stylist || undefined;
+  const startTime = args.startTime || args.time || "";
+  const customDuration = String(args.customDuration || "60");
+  const requestReason = args.requestReason || args.notes || undefined;
+
   if (!customerName) return vapiError(res, toolCallId, "customerName required");
   if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
   if (isNewClient && !customerEmail)
-    return vapiError(res, toolCallId, "customerEmail required when isNewClient=true");
+    return vapiError(res, toolCallId, "Email required for new clients (customerEmail or email).");
   if (!service) return vapiError(res, toolCallId, "service required");
-  if (!startTime) return vapiError(res, toolCallId, "startTime required (ex: 2:30 PM)");
-  if (!customDuration) return vapiError(res, toolCallId, "customDuration required (ex: 60)");
+  if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
+  if (!customDuration) return vapiError(res, toolCallId, "customDuration required (e.g., '60')");
 
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
+
   const { context, page } = await getPage(browser);
 
   let step = "start";
@@ -393,7 +411,7 @@ app.post("/book", async (req, res) => {
       stylist,
       startTime,
       customDuration,
-      requestReason
+      requestReason,
     });
 
     await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
@@ -406,9 +424,8 @@ app.post("/book", async (req, res) => {
         {
           ok: false,
           step,
-          error:
-            'Could not find/click the FINAL appointment "Create" button. Open /debug/appt_create_not_found.png.',
-          debug: "/debug/appt_create_not_found.png"
+          error: 'Could not find/click the FINAL appointment "Create" button.',
+          debug: "/debug/appt_create_not_found.png",
         },
         500
       );
@@ -416,8 +433,8 @@ app.post("/book", async (req, res) => {
 
     return vapiRespond(res, toolCallId, {
       ok: true,
-      message: "Submitted appointment create. Verify in SalonBiz.",
-      debugScreenshot: "/debug/appt_after.png"
+      message: "SalonBiz submission clicked. Verify in SalonBiz.",
+      debugScreenshot: "/debug/appt_after.png",
     });
   } catch (e) {
     console.error("BOOK error at step:", step, e);
@@ -425,7 +442,7 @@ app.post("/book", async (req, res) => {
     return vapiRespond(
       res,
       toolCallId,
-      { ok: false, step, error: e?.message || String(e) },
+      { ok: false, step, error: e?.message || String(e), debug: "/debug/book_error.png" },
       500
     );
   } finally {
@@ -434,6 +451,17 @@ app.post("/book", async (req, res) => {
   }
 });
 
+// Cancel stub (still returns wrapper so it never hangs)
+app.post("/cancel", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  return vapiRespond(res, toolCallId, {
+    ok: false,
+    status: "not_implemented",
+    message: "Cancel not implemented yet.",
+  });
+});
+
+// Debug images
 app.get("/debug/appt_after.png", (req, res) => res.sendFile("/tmp/appt_after.png"));
 app.get("/debug/appt_create_not_found.png", (req, res) =>
   res.sendFile("/tmp/appt_create_not_found.png")
@@ -443,70 +471,8 @@ app.get("/debug/new_client_submit_failed.png", (req, res) =>
   res.sendFile("/tmp/new_client_submit_failed.png")
 );
 
-// ---- debug runner (new client) ----
-app.get("/debug/run_book_new", async (req, res) => {
-  const customerName = String(req.query.name || "");
-  const customerPhone = String(req.query.phone || "");
-  const customerEmail = String(req.query.email || "");
-  const service = String(req.query.service || "");
-  const startTime = String(req.query.time || "");
-  const customDuration = String(req.query.length || "");
-  const stylist = req.query.stylist ? String(req.query.stylist) : undefined;
-  const requestReason = req.query.requestReason ? String(req.query.requestReason) : undefined;
-
-  if (!customerName || !customerPhone || !customerEmail || !service || !startTime || !customDuration) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing required query params: name, phone, email, service, time, length"
-    });
-  }
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
-  });
-  const { context, page } = await getPage(browser);
-
-  try {
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    const result = await runBooking(page, {
-      isNewClient: true,
-      customerName,
-      customerPhone,
-      customerEmail,
-      service,
-      stylist,
-      startTime,
-      customDuration,
-      requestReason
-    });
-
-    await page.screenshot({ path: "/tmp/debug_run_new.png", fullPage: true }).catch(() => {});
-
-    return res.status(200).json({
-      ok: true,
-      result,
-      screenshot: "/debug/debug_run_new.png"
-    });
-  } catch (e) {
-    await page.screenshot({ path: "/tmp/debug_run_new_error.png", fullPage: true }).catch(() => {});
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || String(e),
-      screenshot: "/debug/debug_run_new_error.png"
-    });
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
-});
-
-app.get("/debug/debug_run_new.png", (req, res) => res.sendFile("/tmp/debug_run_new.png"));
-app.get("/debug/debug_run_new_error.png", (req, res) =>
-  res.sendFile("/tmp/debug_run_new_error.png")
-);
+// Optional: keep your existing debug runner(s) if you want.
+// (You can paste them back in if needed.)
 
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
