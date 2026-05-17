@@ -16,7 +16,6 @@ const SALONBIZ_BASE_URL =
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
 const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 
-// If you use the pink create button click-by-percentage trick:
 const CREATE_CLICK_X_PCT = Number(process.env.CREATE_CLICK_X_PCT || 0.95);
 const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
 
@@ -27,19 +26,26 @@ const COOKIE_TTL_MS = Number(process.env.COOKIE_TTL_MS || 1000 * 60 * 60 * 6);
 function requiredEnv(name, value) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
 }
-
 function cookiesExpired() {
   return !cookieState || Date.now() - cookieStateSetAt > COOKIE_TTL_MS;
 }
-
 function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
 }
-
 function formatUsPhoneMaybe(phone) {
   const d = digitsOnly(phone);
   if (d.length === 10) return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`;
   return String(phone || "");
+}
+
+function splitName(full) {
+  const parts = String(full || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const firstName = parts[0] || "";
+  const lastName = parts.slice(1).join(" ") || "";
+  return { firstName, lastName };
 }
 
 function normalizeEmail(raw) {
@@ -50,6 +56,11 @@ function normalizeEmail(raw) {
     .replace(/\(at\)|\sat\s/gi, "@")
     .replace(/\s?dot\s?/gi, ".")
     .toLowerCase();
+}
+
+function isValidEmail(email) {
+  // Simple, practical check (good enough to catch bad STT cases)
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 async function getPage(browser) {
@@ -67,9 +78,6 @@ async function saveCookies(context) {
   cookieStateSetAt = Date.now();
 }
 
-/**
- * SalonBiz login
- */
 async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
@@ -84,7 +92,7 @@ async function loginIfNeeded(page) {
   const passSel = 'input[formcontrolname="password"]';
   const submitSel = 'button[type="submit"]';
 
-  // already logged in
+  // Already logged in
   if ((await page.locator(passSel).count()) === 0) return;
 
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
@@ -157,16 +165,6 @@ async function setTextInput(inputLocator, value) {
   await inputLocator.fill(String(value));
 }
 
-function splitName(full) {
-  const parts = String(full || "")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  const firstName = parts[0] || "";
-  const lastName = parts.slice(1).join(" ") || "";
-  return { firstName, lastName };
-}
-
 async function selectExistingClient(page, query) {
   const clientSearch = page
     .locator("sbiz-book-right-panel")
@@ -195,7 +193,8 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
 
   const { firstName, lastName } = splitName(customerName);
   if (!firstName || !lastName) {
-    throw new Error("customerName must include first + last name for new client creation");
+    await page.screenshot({ path: "/tmp/new_client_missing_lastname.png", fullPage: true }).catch(() => {});
+    throw new Error("New client requires first AND last name.");
   }
 
   const phoneFormatted = formatUsPhoneMaybe(customerPhone);
@@ -258,12 +257,10 @@ function extractToolCall(req) {
     null
   );
 }
-
 function extractToolCallId(req) {
   const toolCall = extractToolCall(req);
   return toolCall?.id || null;
 }
-
 function extractArgs(req) {
   const toolCall = extractToolCall(req);
   const raw = toolCall?.function?.arguments;
@@ -278,26 +275,17 @@ function extractArgs(req) {
   }
   return {};
 }
-
-/** IMPORTANT: Always respond with this wrapper */
 function vapiRespond(res, toolCallId, result, statusCode = 200) {
   return res.status(statusCode).json({ results: [{ toolCallId, result }] });
 }
-
 function vapiError(res, toolCallId, message, statusCode = 400) {
   return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
 // -------------------- routes --------------------
-app.get("/health", (req, res) => {
-  res.json({ ok: true, now: new Date().toISOString() });
-});
+app.get("/health", (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
+app.get("/debug/ping", (req, res) => res.json({ ok: true, msg: "pong" }));
 
-app.get("/debug/ping", (req, res) => {
-  res.json({ ok: true, msg: "pong" });
-});
-
-// Availability stub
 app.post("/availability", (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -357,16 +345,13 @@ async function runBooking(page, {
   return { clickedFinalCreate: clicked };
 }
 
-/**
- * Vapi tool webhook: /book
- * This MUST return { results: [...] }.
- */
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
 
-  // Normalize args (handle both old/new schemas)
+  // Normalize args (assistant may send old + new fields)
   const isNewClient = Boolean(args.isNewClient);
+
   const customerName = args.customerName || args.name || "";
   const customerPhone = args.customerPhone || args.phone || "";
   const customerEmailRaw = args.customerEmail || args.email || "";
@@ -374,14 +359,32 @@ app.post("/book", async (req, res) => {
 
   const service = args.service || "";
   const stylist = args.stylist || undefined;
+
   const startTime = args.startTime || args.time || "";
   const customDuration = String(args.customDuration || "60");
   const requestReason = args.requestReason || args.notes || undefined;
 
+  // Validation (fail fast so the assistant can ask again)
   if (!customerName) return vapiError(res, toolCallId, "customerName required");
   if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
-  if (isNewClient && !customerEmail)
-    return vapiError(res, toolCallId, "Email required for new clients (customerEmail or email).");
+
+  if (isNewClient) {
+    const { firstName, lastName } = splitName(customerName);
+    if (!firstName || !lastName) {
+      return vapiError(
+        res,
+        toolCallId,
+        "For new clients, please provide first AND last name."
+      );
+    }
+    if (!customerEmail) {
+      return vapiError(res, toolCallId, "Email required for new clients.");
+    }
+    if (!isValidEmail(customerEmail)) {
+      return vapiError(res, toolCallId, `That email looks invalid: "${customerEmail}". Please repeat it.`);
+    }
+  }
+
   if (!service) return vapiError(res, toolCallId, "service required");
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
   if (!customDuration) return vapiError(res, toolCallId, "customDuration required (e.g., '60')");
@@ -435,6 +438,16 @@ app.post("/book", async (req, res) => {
       ok: true,
       message: "SalonBiz submission clicked. Verify in SalonBiz.",
       debugScreenshot: "/debug/appt_after.png",
+      normalized: {
+        isNewClient,
+        customerName,
+        customerPhone: digitsOnly(customerPhone),
+        customerEmail,
+        service,
+        stylist,
+        startTime,
+        customDuration,
+      },
     });
   } catch (e) {
     console.error("BOOK error at step:", step, e);
@@ -451,7 +464,7 @@ app.post("/book", async (req, res) => {
   }
 });
 
-// Cancel stub (still returns wrapper so it never hangs)
+// Cancel stub (returns wrapper so it never hangs)
 app.post("/cancel", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   return vapiRespond(res, toolCallId, {
@@ -470,9 +483,6 @@ app.get("/debug/book_error.png", (req, res) => res.sendFile("/tmp/book_error.png
 app.get("/debug/new_client_submit_failed.png", (req, res) =>
   res.sendFile("/tmp/new_client_submit_failed.png")
 );
-
-// Optional: keep your existing debug runner(s) if you want.
-// (You can paste them back in if needed.)
 
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
