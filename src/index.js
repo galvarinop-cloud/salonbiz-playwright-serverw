@@ -16,12 +16,23 @@ const SALONBIZ_BASE_URL =
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
 const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 
+// "Pink create" click fallback if panel isn't open
 const CREATE_CLICK_X_PCT = Number(process.env.CREATE_CLICK_X_PCT || 0.95);
 const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
 
+// TTL for cookies
 let cookieState = null;
 let cookieStateSetAt = 0;
 const COOKIE_TTL_MS = Number(process.env.COOKIE_TTL_MS || 1000 * 60 * 60 * 6);
+
+// Allowlist of phone-bookable services
+const PHONE_BOOKABLE_SERVICES_RAW = process.env.PHONE_BOOKABLE_SERVICES || "";
+const PHONE_BOOKABLE_SERVICES = new Set(
+  PHONE_BOOKABLE_SERVICES_RAW
+    .split(/\r?\n|,/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
 
 function requiredEnv(name, value) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
@@ -37,7 +48,6 @@ function formatUsPhoneMaybe(phone) {
   if (d.length === 10) return `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`;
   return String(phone || "");
 }
-
 function splitName(full) {
   const parts = String(full || "")
     .trim()
@@ -47,7 +57,6 @@ function splitName(full) {
   const lastName = parts.slice(1).join(" ") || "";
   return { firstName, lastName };
 }
-
 function normalizeEmail(raw) {
   if (!raw) return "";
   return String(raw)
@@ -57,10 +66,11 @@ function normalizeEmail(raw) {
     .replace(/\s?dot\s?/gi, ".")
     .toLowerCase();
 }
-
 function isValidEmail(email) {
-  // Simple, practical check (good enough to catch bad STT cases)
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+function uniq(arr) {
+  return Array.from(new Set(arr));
 }
 
 async function getPage(browser) {
@@ -92,7 +102,7 @@ async function loginIfNeeded(page) {
   const passSel = 'input[formcontrolname="password"]';
   const submitSel = 'button[type="submit"]';
 
-  // Already logged in
+  // already logged in
   if ((await page.locator(passSel).count()) === 0) return;
 
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
@@ -154,8 +164,9 @@ async function ensureCreatePanelOpen(page) {
 async function typeaheadSelect(inputLocator, value) {
   await inputLocator.click({ timeout: 15000 });
   await inputLocator.fill("");
-  await inputLocator.type(String(value), { delay: 35 });
-  await inputLocator.page().waitForTimeout(700);
+  await inputLocator.type(String(value), { delay: 25 });
+  await inputLocator.page().waitForTimeout(600);
+  // Select first suggestion
   await inputLocator.page().keyboard.press("ArrowDown");
   await inputLocator.page().keyboard.press("Enter");
 }
@@ -164,6 +175,217 @@ async function setTextInput(inputLocator, value) {
   await inputLocator.click({ timeout: 15000 });
   await inputLocator.fill(String(value));
 }
+
+/**
+ * Reads the currently open ngb-typeahead suggestion list under an input.
+ * Works with your DOM: <ngb-typeahead-window ...> <button class="dropdown-item">...</button>
+ */
+async function readNgbTypeaheadOptions(page) {
+  const window = page.locator("ngb-typeahead-window.dropdown-menu.show").first();
+  const options = window.locator("button.dropdown-item");
+  const count = await options.count().catch(() => 0);
+  if (!count) return [];
+
+  const texts = [];
+  for (let i = 0; i < count; i++) {
+    const t = await options.nth(i).innerText().catch(() => "");
+    const cleaned = String(t || "").replace(/\s+/g, " ").trim();
+    if (cleaned) texts.push(cleaned);
+  }
+  return texts;
+}
+
+/**
+ * Scrape all typeahead results by querying a-z0-9, dedupe union.
+ * This is "full mode" and will be slower but complete.
+ */
+async function scrapeTypeaheadUniverse(inputLocator, page) {
+  const queries = [
+    ..."abcdefghijklmnopqrstuvwxyz".split(""),
+    ..."0123456789".split(""),
+  ];
+
+  const all = new Set();
+
+  for (const q of queries) {
+    await inputLocator.click();
+    await inputLocator.fill("");
+    await inputLocator.type(q, { delay: 20 });
+
+    await page.waitForTimeout(450);
+
+    const items = await readNgbTypeaheadOptions(page);
+    for (const it of items) all.add(it);
+
+    // slight backoff
+    await page.waitForTimeout(120);
+  }
+
+  return Array.from(all).sort((a, b) => a.localeCompare(b));
+}
+
+// -------------------- Vapi tool webhook helpers --------------------
+function extractToolCall(req) {
+  return (
+    req.body?.message?.toolCallList?.[0] ||
+    req.body?.message?.toolCalls?.[0] ||
+    null
+  );
+}
+function extractToolCallId(req) {
+  const toolCall = extractToolCall(req);
+  return toolCall?.id || null;
+}
+function extractArgs(req) {
+  const toolCall = extractToolCall(req);
+  const raw = toolCall?.function?.arguments;
+
+  if (raw && typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+function vapiRespond(res, toolCallId, result, statusCode = 200) {
+  return res.status(statusCode).json({ results: [{ toolCallId, result }] });
+}
+function vapiError(res, toolCallId, message, statusCode = 400) {
+  return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
+}
+
+// -------------------- routes --------------------
+app.get("/health", (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
+app.get("/debug/ping", (req, res) => res.json({ ok: true, msg: "pong" }));
+
+/**
+ * Vapi tool: list services that are phone-bookable
+ * POST /services
+ */
+app.post("/services", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+
+  if (!PHONE_BOOKABLE_SERVICES.size) {
+    return vapiError(
+      res,
+      toolCallId,
+      "PHONE_BOOKABLE_SERVICES env var is empty. Add comma or newline separated service names."
+    );
+  }
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+  const { context, page } = await getPage(browser);
+
+  let step = "start";
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    step = "login";
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    step = "openPanel";
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(2500);
+    const serviceInput = await ensureCreatePanelOpen(page);
+
+    step = "scrapeServices";
+    const allServices = await scrapeTypeaheadUniverse(serviceInput, page);
+
+    const phoneBookable = allServices.filter((s) => PHONE_BOOKABLE_SERVICES.has(s));
+
+    return vapiRespond(res, toolCallId, {
+      ok: true,
+      countAll: allServices.length,
+      countPhoneBookable: phoneBookable.length,
+      services: phoneBookable,
+    });
+  } catch (e) {
+    console.error("SERVICES error at step:", step, e);
+    await page.screenshot({ path: "/tmp/services_error.png", fullPage: true }).catch(() => {});
+    return vapiRespond(
+      res,
+      toolCallId,
+      { ok: false, step, error: e?.message || String(e), debug: "/debug/services_error.png" },
+      500
+    );
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+/**
+ * Vapi tool: list stylists (staff)
+ * POST /stylists
+ */
+app.post("/stylists", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+  const { context, page } = await getPage(browser);
+
+  let step = "start";
+  try {
+    if (cookiesExpired()) cookieState = null;
+
+    step = "login";
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    step = "openPanel";
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(2500);
+    await ensureCreatePanelOpen(page);
+
+    step = "scrapeStaff";
+    const staffInput = page
+      .locator("sbiz-book-right-panel")
+      .locator('input[formcontrolname="staff"]')
+      .first();
+    await staffInput.waitFor({ state: "visible", timeout: 20000 });
+
+    const stylists = await scrapeTypeaheadUniverse(staffInput, page);
+
+    return vapiRespond(res, toolCallId, {
+      ok: true,
+      count: stylists.length,
+      stylists,
+    });
+  } catch (e) {
+    console.error("STYLISTS error at step:", step, e);
+    await page.screenshot({ path: "/tmp/stylists_error.png", fullPage: true }).catch(() => {});
+    return vapiRespond(
+      res,
+      toolCallId,
+      { ok: false, step, error: e?.message || String(e), debug: "/debug/stylists_error.png" },
+      500
+    );
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+// Availability stub (you can keep your real one if you have it)
+app.post("/availability", (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
+  return vapiRespond(res, toolCallId, {
+    ok: true,
+    available: true,
+    bookingDateAndTime: args?.bookingDateAndTime || null,
+  });
+});
 
 async function selectExistingClient(page, query) {
   const clientSearch = page
@@ -226,6 +448,8 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
 }
 
 async function clickFinalAppointmentCreate(page) {
+  // In your HTML, the final "Create" isn't shown in the snippet,
+  // so we try several patterns.
   const panel = page.locator("sbiz-book-right-panel");
 
   const candidates = [
@@ -248,53 +472,6 @@ async function clickFinalAppointmentCreate(page) {
   }
   return false;
 }
-
-// -------------------- Vapi tool webhook helpers --------------------
-function extractToolCall(req) {
-  return (
-    req.body?.message?.toolCallList?.[0] ||
-    req.body?.message?.toolCalls?.[0] ||
-    null
-  );
-}
-function extractToolCallId(req) {
-  const toolCall = extractToolCall(req);
-  return toolCall?.id || null;
-}
-function extractArgs(req) {
-  const toolCall = extractToolCall(req);
-  const raw = toolCall?.function?.arguments;
-
-  if (raw && typeof raw === "object") return raw;
-  if (typeof raw === "string") {
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return {};
-    }
-  }
-  return {};
-}
-function vapiRespond(res, toolCallId, result, statusCode = 200) {
-  return res.status(statusCode).json({ results: [{ toolCallId, result }] });
-}
-function vapiError(res, toolCallId, message, statusCode = 400) {
-  return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
-}
-
-// -------------------- routes --------------------
-app.get("/health", (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
-app.get("/debug/ping", (req, res) => res.json({ ok: true, msg: "pong" }));
-
-app.post("/availability", (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  const args = extractArgs(req);
-  return vapiRespond(res, toolCallId, {
-    ok: true,
-    available: true,
-    bookingDateAndTime: args?.bookingDateAndTime || null,
-  });
-});
 
 async function runBooking(page, {
   isNewClient,
@@ -334,6 +511,7 @@ async function runBooking(page, {
     await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason);
   }
 
+  // scroll to bottom of right panel if needed
   await panel
     .evaluate((el) => {
       const scrollable = el.querySelector(".scrollable");
@@ -345,11 +523,15 @@ async function runBooking(page, {
   return { clickedFinalCreate: clicked };
 }
 
+/**
+ * Vapi tool webhook: /book
+ * This MUST return { results: [...] }.
+ */
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
 
-  // Normalize args (assistant may send old + new fields)
+  // Normalize args (assistant may send old/new fields)
   const isNewClient = Boolean(args.isNewClient);
 
   const customerName = args.customerName || args.name || "";
@@ -364,28 +546,30 @@ app.post("/book", async (req, res) => {
   const customDuration = String(args.customDuration || "60");
   const requestReason = args.requestReason || args.notes || undefined;
 
-  // Validation (fail fast so the assistant can ask again)
+  // Validation (fail fast so assistant can ask again)
   if (!customerName) return vapiError(res, toolCallId, "customerName required");
   if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
 
   if (isNewClient) {
     const { firstName, lastName } = splitName(customerName);
     if (!firstName || !lastName) {
-      return vapiError(
-        res,
-        toolCallId,
-        "For new clients, please provide first AND last name."
-      );
+      return vapiError(res, toolCallId, "For new clients, please provide first AND last name.");
     }
-    if (!customerEmail) {
-      return vapiError(res, toolCallId, "Email required for new clients.");
-    }
+    if (!customerEmail) return vapiError(res, toolCallId, "Email required for new clients.");
     if (!isValidEmail(customerEmail)) {
       return vapiError(res, toolCallId, `That email looks invalid: "${customerEmail}". Please repeat it.`);
     }
   }
 
   if (!service) return vapiError(res, toolCallId, "service required");
+  if (PHONE_BOOKABLE_SERVICES.size && !PHONE_BOOKABLE_SERVICES.has(service)) {
+    return vapiError(
+      res,
+      toolCallId,
+      `Service "${service}" is not phone-bookable. Choose a different service.`
+    );
+  }
+
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
   if (!customDuration) return vapiError(res, toolCallId, "customDuration required (e.g., '60')");
 
@@ -393,7 +577,6 @@ app.post("/book", async (req, res) => {
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
-
   const { context, page } = await getPage(browser);
 
   let step = "start";
@@ -403,6 +586,31 @@ app.post("/book", async (req, res) => {
     step = "login";
     await loginIfNeeded(page);
     await saveCookies(context);
+
+    // Optional: validate stylist exists (costs time; can remove if too slow)
+    if (stylist) {
+      step = "validateStylist";
+      await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(2500);
+      await ensureCreatePanelOpen(page);
+
+      const staffInput = page
+        .locator("sbiz-book-right-panel")
+        .locator('input[formcontrolname="staff"]')
+        .first();
+      await staffInput.waitFor({ state: "visible", timeout: 20000 });
+
+      // quick validation: query first letter(s) of stylist
+      await staffInput.click();
+      await staffInput.fill("");
+      await staffInput.type(String(stylist).slice(0, 1), { delay: 20 });
+      await page.waitForTimeout(450);
+      const staffOptions = await readNgbTypeaheadOptions(page);
+      if (staffOptions.length && !staffOptions.some((x) => x.toLowerCase() === stylist.toLowerCase())) {
+        // not strictly fatal; but helps prevent mis-booking
+        console.log("WARN stylist not in immediate suggestions:", stylist, staffOptions.slice(0, 10));
+      }
+    }
 
     step = "runBooking";
     const result = await runBooking(page, {
@@ -464,24 +672,19 @@ app.post("/book", async (req, res) => {
   }
 });
 
-// Cancel stub (returns wrapper so it never hangs)
-app.post("/cancel", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  return vapiRespond(res, toolCallId, {
-    ok: false,
-    status: "not_implemented",
-    message: "Cancel not implemented yet.",
-  });
-});
-
 // Debug images
 app.get("/debug/appt_after.png", (req, res) => res.sendFile("/tmp/appt_after.png"));
 app.get("/debug/appt_create_not_found.png", (req, res) =>
   res.sendFile("/tmp/appt_create_not_found.png")
 );
 app.get("/debug/book_error.png", (req, res) => res.sendFile("/tmp/book_error.png"));
+app.get("/debug/services_error.png", (req, res) => res.sendFile("/tmp/services_error.png"));
+app.get("/debug/stylists_error.png", (req, res) => res.sendFile("/tmp/stylists_error.png"));
 app.get("/debug/new_client_submit_failed.png", (req, res) =>
   res.sendFile("/tmp/new_client_submit_failed.png")
+);
+app.get("/debug/new_client_missing_lastname.png", (req, res) =>
+  res.sendFile("/tmp/new_client_missing_lastname.png")
 );
 
 app.listen(PORT, () => {
