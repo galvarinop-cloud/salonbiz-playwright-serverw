@@ -563,113 +563,99 @@ app.post("/book", async (req, res) => {
 
   if (!service) return vapiError(res, toolCallId, "service required");
   if (PHONE_BOOKABLE_SERVICES.size && !PHONE_BOOKABLE_SERVICES.has(service)) {
-    return vapiError(
-      res,
-      toolCallId,
-      `Service "${service}" is not phone-bookable. Choose a different service.`
-    );
+    return vapiError(res, toolCallId, `Service "${service}" is not phone-bookable. Choose a different service.`);
   }
 
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
   if (!customDuration) return vapiError(res, toolCallId, "customDuration required (e.g., '60')");
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  // ✅ Respond immediately so Vapi never times out
+  vapiRespond(res, toolCallId, {
+    ok: true,
+    message: "Booking started"
   });
-  const { context, page } = await getPage(browser);
 
-  let step = "start";
-  try {
-    if (cookiesExpired()) cookieState = null;
-
-    step = "login";
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
-    // Optional: validate stylist exists (costs time; can remove if too slow)
-    if (stylist) {
-      step = "validateStylist";
-      await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(2500);
-      await ensureCreatePanelOpen(page);
-
-      const staffInput = page
-        .locator("sbiz-book-right-panel")
-        .locator('input[formcontrolname="staff"]')
-        .first();
-      await staffInput.waitFor({ state: "visible", timeout: 20000 });
-
-      // quick validation: query first letter(s) of stylist
-      await staffInput.click();
-      await staffInput.fill("");
-      await staffInput.type(String(stylist).slice(0, 1), { delay: 20 });
-      await page.waitForTimeout(450);
-      const staffOptions = await readNgbTypeaheadOptions(page);
-      if (staffOptions.length && !staffOptions.some((x) => x.toLowerCase() === stylist.toLowerCase())) {
-        // not strictly fatal; but helps prevent mis-booking
-        console.log("WARN stylist not in immediate suggestions:", stylist, staffOptions.slice(0, 10));
-      }
-    }
-
-    step = "runBooking";
-    const result = await runBooking(page, {
-      isNewClient,
-      customerName,
-      customerPhone,
-      customerEmail,
-      service,
-      stylist,
-      startTime,
-      customDuration,
-      requestReason,
+  // ✅ Continue booking in the background
+  void (async () => {
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
+    const { context, page } = await getPage(browser);
 
-    await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
+    let step = "start";
+    try {
+      if (cookiesExpired()) cookieState = null;
 
-    if (!result.clickedFinalCreate) {
-      await page.screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true }).catch(() => {});
-      return vapiRespond(
-        res,
-        toolCallId,
-        {
-          ok: false,
-          step,
-          error: 'Could not find/click the FINAL appointment "Create" button.',
-          debug: "/debug/appt_create_not_found.png",
-        },
-        500
-      );
-    }
+      step = "login";
+      await loginIfNeeded(page);
+      await saveCookies(context);
 
-    return vapiRespond(res, toolCallId, {
-      ok: true,
-      message: "SalonBiz submission clicked. Verify in SalonBiz.",
-      debugScreenshot: "/debug/appt_after.png",
-      normalized: {
+      // Optional stylist validation (keep or remove)
+      if (stylist) {
+        step = "validateStylist";
+        await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
+        await page.waitForTimeout(2500);
+        await ensureCreatePanelOpen(page);
+
+        const staffInput = page
+          .locator("sbiz-book-right-panel")
+          .locator('input[formcontrolname="staff"]')
+          .first();
+        await staffInput.waitFor({ state: "visible", timeout: 20000 });
+
+        await staffInput.click();
+        await staffInput.fill("");
+        await staffInput.type(String(stylist).slice(0, 1), { delay: 20 });
+        await page.waitForTimeout(450);
+        const staffOptions = await readNgbTypeaheadOptions(page);
+        if (staffOptions.length && !staffOptions.some((x) => x.toLowerCase() === String(stylist).toLowerCase())) {
+          console.log("WARN stylist not in immediate suggestions:", stylist, staffOptions.slice(0, 10));
+        }
+      }
+
+      step = "runBooking";
+      const result = await runBooking(page, {
         isNewClient,
         customerName,
-        customerPhone: digitsOnly(customerPhone),
+        customerPhone,
         customerEmail,
         service,
         stylist,
         startTime,
         customDuration,
-      },
-    });
-  } catch (e) {
-    console.error("BOOK error at step:", step, e);
-    await page.screenshot({ path: "/tmp/book_error.png", fullPage: true }).catch(() => {});
-    return vapiRespond(
-      res,
-      toolCallId,
-      { ok: false, step, error: e?.message || String(e), debug: "/debug/book_error.png" },
-      500
-    );
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-  }
+        requestReason,
+      });
+
+      await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
+
+      if (!result.clickedFinalCreate) {
+        await page.screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true }).catch(() => {});
+        console.error("BOOKING_FAILED_CREATE_BUTTON_NOT_FOUND", { step, toolCallId });
+        return;
+      }
+
+      console.log("BOOKING_SUCCESS", {
+        toolCallId,
+        normalized: {
+          isNewClient,
+          customerName,
+          customerPhone: digitsOnly(customerPhone),
+          customerEmail,
+          service,
+          stylist,
+          startTime,
+          customDuration,
+        },
+      });
+    } catch (e) {
+      console.error("BOOKING_FAILED", { toolCallId, step, error: e?.message || String(e) });
+      await page.screenshot({ path: "/tmp/book_error.png", fullPage: true }).catch(() => {});
+    } finally {
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+    }
+  })();
 });
 
 // Debug images
