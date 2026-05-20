@@ -534,62 +534,10 @@ async function runBooking(
  * Vapi tool webhook: /book
  * Returns immediately with jobId; booking runs in background.
  */
-app.post("/book", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  const args = extractArgs(req);
-
-  // Normalize args
-  const isNewClient = Boolean(args.isNewClient);
-
-  const customerName = args.customerName || args.name || "";
-  const customerPhone = args.customerPhone || args.phone || "";
-  const customerEmailRaw = args.customerEmail || args.email || "";
-  const customerEmail = normalizeEmail(customerEmailRaw);
-
-  const service = args.service || "";
-  const stylist = args.stylist || undefined;
-
-  const startTime = args.startTime || args.time || "";
-  const customDuration = String(args.customDuration || "60");
-  const requestReason = args.requestReason || args.notes || undefined;
-
-  // Validation (fail fast so assistant can ask again)
-  if (!customerName) return vapiError(res, toolCallId, "customerName required");
-  if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
-
-  if (isNewClient) {
-    const { firstName, lastName } = splitName(customerName);
-    if (!firstName || !lastName) {
-      return vapiError(res, toolCallId, "For new clients, please provide first AND last name.");
-    }
-    if (!customerEmail) return vapiError(res, toolCallId, "Email required for new clients.");
-    if (!isValidEmail(customerEmail)) {
-      return vapiError(res, toolCallId, `That email looks invalid: "${customerEmail}". Please repeat it.`);
-    }
-  }
-
-  if (!service) return vapiError(res, toolCallId, "service required");
-  if (PHONE_BOOKABLE_SERVICES.size && !PHONE_BOOKABLE_SERVICES.has(service)) {
-    return vapiError(
-      res,
-      toolCallId,
-      `Service "${service}" is not phone-bookable. Choose a different service.`
-    );
-  }
-
-  if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
-  if (!customDuration) return vapiError(res, toolCallId, "customDuration required (e.g., '60')");
-
-  // Create job + respond immediately (prevents timeout)
-  const jobId = newJobId();
-  bookingJobs.set(jobId, { status: "running", createdAt: Date.now() });
-
-  return vapiRespond(res, toolCallId, { ok: true, jobId, status: "running" });
-});
-
-// NOTE: Background runner is in Part 3, so we don't exceed message size.
-// Part 3 continues from here.
-// ---------- Background booking runner (continues the /book route) ----------
+/**
+ * Vapi tool webhook: /book
+ * Returns immediately with jobId; booking runs in background.
+ */
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -608,7 +556,7 @@ app.post("/book", async (req, res) => {
   const customDuration = String(args.customDuration || "60");
   const requestReason = args.requestReason || args.notes || undefined;
 
-  // Validation
+  // Validation (fail fast)
   if (!customerName) return vapiError(res, toolCallId, "customerName required");
   if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
 
@@ -634,6 +582,7 @@ app.post("/book", async (req, res) => {
   // Create job + respond immediately
   const jobId = newJobId();
   bookingJobs.set(jobId, { status: "running", createdAt: Date.now() });
+
   vapiRespond(res, toolCallId, { ok: true, jobId, status: "running" });
 
   // Run Playwright in the background
@@ -712,7 +661,6 @@ app.post("/book", async (req, res) => {
     }
   })();
 });
-
 // ---------- New endpoint: /book/status ----------
 app.post("/book/status", async (req, res) => {
   const toolCallId = extractToolCallId(req);
