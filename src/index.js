@@ -61,7 +61,7 @@ function normalizeEmail(raw) {
   if (!raw) return "";
   return String(raw)
     .trim()
-    .replace(/\s+/g, "")
+    .replace(/\s+/g, "") // remove spaces
     .replace(/\(at\)|\sat\s/gi, "@")
     .replace(/\s?dot\s?/gi, ".")
     .toLowerCase();
@@ -347,7 +347,9 @@ app.post("/stylists", async (req, res) => {
     await saveCookies(context);
 
     step = "openPanel";
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded",
+    });
     await page.waitForTimeout(2500);
     await ensureCreatePanelOpen(page);
 
@@ -382,7 +384,7 @@ app.post("/stylists", async (req, res) => {
   }
 });
 
-// Availability stub (you can keep your real one if you have it)
+// Availability stub (keep if needed)
 app.post("/availability", (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -393,6 +395,7 @@ app.post("/availability", (req, res) => {
   });
 });
 
+// -------------------- booking helpers --------------------
 async function selectExistingClient(page, query) {
   const clientSearch = page
     .locator("sbiz-book-right-panel")
@@ -421,7 +424,9 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
 
   const { firstName, lastName } = splitName(customerName);
   if (!firstName || !lastName) {
-    await page.screenshot({ path: "/tmp/new_client_missing_lastname.png", fullPage: true }).catch(() => {});
+    await page
+      .screenshot({ path: "/tmp/new_client_missing_lastname.png", fullPage: true })
+      .catch(() => {});
     throw new Error("New client requires first AND last name.");
   }
 
@@ -443,7 +448,9 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
   const stillVisible = await modal.isVisible().catch(() => false);
   if (stillVisible) {
     const alertText = await modal.locator(".sbiz-alert").innerText().catch(() => "");
-    await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
+    await page
+      .screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true })
+      .catch(() => {});
     throw new Error(
       `New client modal did not close. SalonBiz error: ${alertText || "(no alert text found)"}`
     );
@@ -477,20 +484,17 @@ async function clickFinalAppointmentCreate(page) {
   return false;
 }
 
-async function runBooking(
-  page,
-  {
-    isNewClient,
-    customerName,
-    customerPhone,
-    customerEmail,
-    service,
-    stylist,
-    startTime,
-    customDuration,
-    requestReason,
-  }
-) {
+async function runBooking(page, {
+  isNewClient,
+  customerName,
+  customerPhone,
+  customerEmail,
+  service,
+  stylist,
+  startTime,
+  customDuration,
+  requestReason,
+}) {
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(2500);
 
@@ -518,7 +522,6 @@ async function runBooking(
     await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason);
   }
 
-  // scroll to bottom of right panel if needed
   await panel
     .evaluate((el) => {
       const scrollable = el.querySelector(".scrollable");
@@ -529,11 +532,6 @@ async function runBooking(
   const clicked = await clickFinalAppointmentCreate(page);
   return { clickedFinalCreate: clicked };
 }
-
-/**
- * Vapi tool webhook: /book
- * Returns immediately with jobId; booking runs in background.
- */
 /**
  * Vapi tool webhook: /book
  * Returns immediately with jobId; booking runs in background.
@@ -585,7 +583,7 @@ app.post("/book", async (req, res) => {
 
   vapiRespond(res, toolCallId, { ok: true, jobId, status: "running" });
 
-  // Run Playwright in the background
+  // Background Playwright booking
   void (async () => {
     const browser = await chromium.launch({
       headless: true,
@@ -661,7 +659,11 @@ app.post("/book", async (req, res) => {
     }
   })();
 });
-// ---------- New endpoint: /book/status ----------
+
+/**
+ * /book/status
+ * The assistant should poll this until status === "succeeded" before confirming.
+ */
 app.post("/book/status", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -684,7 +686,7 @@ app.post("/book/status", async (req, res) => {
   });
 });
 
-// ---------- Debug images ----------
+// -------------------- Debug images --------------------
 app.get("/debug/appt_after.png", (req, res) => res.sendFile("/tmp/appt_after.png"));
 app.get("/debug/appt_create_not_found.png", (req, res) =>
   res.sendFile("/tmp/appt_create_not_found.png")
