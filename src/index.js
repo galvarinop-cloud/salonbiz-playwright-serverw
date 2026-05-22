@@ -36,13 +36,15 @@ const PHONE_BOOKABLE_SERVICES = new Set(
 
 /**
  * ===========
- * STYLIST CACHE (NEW)
+ * STYLIST CACHE (FIXED)
  * ===========
- * Prevents /stylists from timing out by caching the stylist list in memory.
+ * - caches stylist list in memory to avoid tool timeouts
+ * - filters out "Head Spa room"
+ * - strips last names (first name only)
  */
 let stylistCache = {
-  value: null, // array of stylist names
-  fetchedAt: 0
+  value: null, // array of first names
+  fetchedAt: 0,
 };
 const STYLIST_CACHE_TTL_MS = Number(
   process.env.STYLIST_CACHE_TTL_MS || 10 * 60 * 1000
@@ -75,7 +77,7 @@ function normalizeEmail(raw) {
   if (!raw) return "";
   return String(raw)
     .trim()
-    .replace(/\s+/g, "")
+    .replace(/\s+/g, "") // remove spaces
     .replace(/\(at\)|\sat\s/gi, "@")
     .replace(/\s?dot\s?/gi, ".")
     .toLowerCase();
@@ -113,6 +115,7 @@ async function loginIfNeeded(page) {
   const passSel = 'input[formcontrolname="password"]';
   const submitSel = 'button[type="submit"]';
 
+  // already logged in
   if ((await page.locator(passSel).count()) === 0) return;
 
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
@@ -226,9 +229,8 @@ async function scrapeTypeaheadUniverse(inputLocator, page) {
 
 /**
  * ===========
- * CACHED STYLIST FETCH (NEW)
+ * CACHED STYLIST FETCH (FIXED)
  * ===========
- * This is basically your old /stylists logic but wrapped for caching.
  */
 async function fetchStylistsFromSalonBiz() {
   const browser = await chromium.launch({
@@ -259,8 +261,25 @@ async function fetchStylistsFromSalonBiz() {
       .first();
     await staffInput.waitFor({ state: "visible", timeout: 20000 });
 
-    const stylists = await scrapeTypeaheadUniverse(staffInput, page);
-    return stylists;
+    const stylistsRaw = await scrapeTypeaheadUniverse(staffInput, page);
+
+    // filter out non-stylists (e.g., "Head Spa room")
+    const filtered = stylistsRaw.filter((name) => {
+      const n = String(name || "").trim().toLowerCase();
+      if (!n) return false;
+      if (n.includes("head spa")) return false;
+      return true;
+    });
+
+    // first name only (strip last names)
+    const cleaned = filtered
+      .map((name) => String(name).trim().split(/\s+/)[0])
+      .filter(Boolean);
+
+    // de-dupe while preserving order
+    const deduped = Array.from(new Set(cleaned));
+
+    return deduped;
   } catch (e) {
     console.error("fetchStylistsFromSalonBiz error at step:", step, e);
     await page
@@ -289,6 +308,7 @@ async function getStylistsCached() {
 
   return { stylists, cached: false, cacheAgeMs: 0 };
 }
+
 // -------------------- Vapi tool webhook helpers --------------------
 function extractToolCall(req) {
   return (
@@ -408,14 +428,13 @@ app.post("/services", async (req, res) => {
  * Vapi tool: list stylists (staff)
  * POST /stylists
  *
- * NOW CACHED: returns quickly if cache is warm.
+ * Cached + cleaned (no last names, no "Head Spa room")
  */
 app.post("/stylists", async (req, res) => {
   const toolCallId = extractToolCallId(req);
 
   try {
     const { stylists, cached, cacheAgeMs } = await getStylistsCached();
-
     return vapiRespond(res, toolCallId, {
       ok: true,
       cached,
@@ -444,6 +463,7 @@ app.post("/availability", (req, res) => {
     bookingDateAndTime: args?.bookingDateAndTime || null,
   });
 });
+
 // -------------------- booking helpers --------------------
 async function selectExistingClient(page, query) {
   const clientSearch = page
@@ -533,20 +553,17 @@ async function clickFinalAppointmentCreate(page) {
   return false;
 }
 
-async function runBooking(
-  page,
-  {
-    isNewClient,
-    customerName,
-    customerPhone,
-    customerEmail,
-    service,
-    stylist,
-    startTime,
-    customDuration,
-    requestReason,
-  }
-) {
+async function runBooking(page, {
+  isNewClient,
+  customerName,
+  customerPhone,
+  customerEmail,
+  service,
+  stylist,
+  startTime,
+  customDuration,
+  requestReason,
+}) {
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(2500);
 
@@ -568,10 +585,7 @@ async function runBooking(
   }
 
   await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
-  await setTextInput(
-    panel.locator('input[formcontrolname="customDuration"]').first(),
-    customDuration
-  );
+  await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
 
   if (requestReason) {
     await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason);
@@ -621,21 +635,13 @@ app.post("/book", async (req, res) => {
     }
     if (!customerEmail) return vapiError(res, toolCallId, "Email required for new clients.");
     if (!isValidEmail(customerEmail)) {
-      return vapiError(
-        res,
-        toolCallId,
-        `That email looks invalid: "${customerEmail}". Please repeat it.`
-      );
+      return vapiError(res, toolCallId, `That email looks invalid: "${customerEmail}". Please repeat it.`);
     }
   }
 
   if (!service) return vapiError(res, toolCallId, "service required");
   if (PHONE_BOOKABLE_SERVICES.size && !PHONE_BOOKABLE_SERVICES.has(service)) {
-    return vapiError(
-      res,
-      toolCallId,
-      `Service "${service}" is not phone-bookable. Choose a different service.`
-    );
+    return vapiError(res, toolCallId, `Service "${service}" is not phone-bookable. Choose a different service.`);
   }
 
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
@@ -679,9 +685,7 @@ app.post("/book", async (req, res) => {
       await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
 
       if (!result.clickedFinalCreate) {
-        await page
-          .screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true })
-          .catch(() => {});
+        await page.screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true }).catch(() => {});
         bookingJobs.set(jobId, {
           status: "failed",
           createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
@@ -770,14 +774,14 @@ app.get("/debug/new_client_missing_lastname.png", (req, res) =>
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
 
-  // NEW: warm stylist cache shortly after boot
+  // warm stylist cache shortly after boot
   setTimeout(() => {
     getStylistsCached()
       .then(({ cached }) => console.log(`Stylist cache warmed (cached=${cached})`))
       .catch((e) => console.warn("Stylist cache warmup failed:", e?.message || e));
   }, 2000);
 
-  // Optional: background refresh to keep cache hot
+  // keep cache hot
   setInterval(() => {
     getStylistsCached().catch(() => {});
   }, STYLIST_CACHE_TTL_MS);
