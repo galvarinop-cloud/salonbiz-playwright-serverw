@@ -399,7 +399,9 @@ app.post("/services", async (req, res) => {
     step = "scrapeServices";
     const allServices = await scrapeTypeaheadUniverse(serviceInput, page);
 
-    const phoneBookable = allServices.filter((s) => PHONE_BOOKABLE_SERVICES.has(s));
+    const phoneBookable = allServices.filter((s) =>
+      PHONE_BOOKABLE_SERVICES.has(s)
+    );
 
     return vapiRespond(res, toolCallId, {
       ok: true,
@@ -415,7 +417,12 @@ app.post("/services", async (req, res) => {
     return vapiRespond(
       res,
       toolCallId,
-      { ok: false, step, error: e?.message || String(e), debug: "/debug/services_error.png" },
+      {
+        ok: false,
+        step,
+        error: e?.message || String(e),
+        debug: "/debug/services_error.png",
+      },
       500
     );
   } finally {
@@ -423,7 +430,6 @@ app.post("/services", async (req, res) => {
     await browser.close().catch(() => {});
   }
 });
-
 /**
  * Vapi tool: list stylists (staff)
  * POST /stylists
@@ -447,7 +453,11 @@ app.post("/stylists", async (req, res) => {
     return vapiRespond(
       res,
       toolCallId,
-      { ok: false, error: e?.message || String(e), debug: "/debug/stylists_error.png" },
+      {
+        ok: false,
+        error: e?.message || String(e),
+        debug: "/debug/stylists_error.png",
+      },
       500
     );
   }
@@ -635,13 +645,21 @@ app.post("/book", async (req, res) => {
     }
     if (!customerEmail) return vapiError(res, toolCallId, "Email required for new clients.");
     if (!isValidEmail(customerEmail)) {
-      return vapiError(res, toolCallId, `That email looks invalid: "${customerEmail}". Please repeat it.`);
+      return vapiError(
+        res,
+        toolCallId,
+        `That email looks invalid: "${customerEmail}". Please repeat it.`
+      );
     }
   }
 
   if (!service) return vapiError(res, toolCallId, "service required");
   if (PHONE_BOOKABLE_SERVICES.size && !PHONE_BOOKABLE_SERVICES.has(service)) {
-    return vapiError(res, toolCallId, `Service "${service}" is not phone-bookable. Choose a different service.`);
+    return vapiError(
+      res,
+      toolCallId,
+      `Service "${service}" is not phone-bookable. Choose a different service.`
+    );
   }
 
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
@@ -729,10 +747,11 @@ app.post("/book", async (req, res) => {
     }
   })();
 });
-
 /**
  * /book/status
- * The assistant should poll this until status === "succeeded" before confirming.
+ * FIXED:
+ * - running => ok:false + explicit "do not confirm"
+ * - only ok:true when succeeded
  */
 app.post("/book/status", async (req, res) => {
   const toolCallId = extractToolCallId(req);
@@ -743,16 +762,41 @@ app.post("/book/status", async (req, res) => {
 
   const job = bookingJobs.get(jobId);
   if (!job) {
-    return vapiRespond(res, toolCallId, { ok: false, jobId, status: "not_found" });
+    return vapiRespond(res, toolCallId, {
+      ok: false,
+      jobId,
+      status: "not_found",
+      message: "Booking job not found. Do not confirm. Try again.",
+    });
+  }
+
+  if (job.status === "running") {
+    return vapiRespond(res, toolCallId, {
+      ok: false,
+      jobId,
+      status: "running",
+      message: "Still booking. Do not confirm yet. Keep polling.",
+    });
+  }
+
+  if (job.status === "failed") {
+    return vapiRespond(res, toolCallId, {
+      ok: false,
+      jobId,
+      status: "failed",
+      error: job.error || "Booking failed",
+      debugScreenshot: job.debugScreenshot,
+      message: "Booking failed. Do not confirm. Ask for an alternate time/service.",
+    });
   }
 
   return vapiRespond(res, toolCallId, {
     ok: true,
     jobId,
-    status: job.status,
+    status: "succeeded",
     result: job.result,
-    error: job.error,
     debugScreenshot: job.debugScreenshot,
+    message: "Booking succeeded. You may confirm the appointment now.",
   });
 });
 
