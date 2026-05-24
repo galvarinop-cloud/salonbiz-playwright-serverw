@@ -39,10 +39,9 @@ const STYLIST_CACHE_TTL_MS = Number(
 
 // ============================================================
 // SCHEDULE CACHE
-// Keyed by "YYYY-MM-DD" so each date is cached separately.
-// TTL is shorter (5 min) since schedules can change intraday.
+// Keyed by "YYYY-MM-DD". TTL = 5 min (schedules can change intraday).
 // ============================================================
-const scheduleCache = new Map(); // key: "YYYY-MM-DD" → { fetchedAt, data }
+const scheduleCache = new Map();
 const SCHEDULE_CACHE_TTL_MS = Number(
   process.env.SCHEDULE_CACHE_TTL_MS || 5 * 60 * 1000
 );
@@ -102,13 +101,11 @@ function formatYYYYMMDD(d) {
 // ============================================================
 // TIME PARSING HELPERS
 // ============================================================
-// Converts "5:00 PM", "17:00", "5pm" → minutes since midnight (integer).
-// Returns null if unparseable.
 function parseTimeToMinutes(timeStr) {
   if (!timeStr) return null;
   const s = String(timeStr).trim().toUpperCase();
 
-  // "HH:MM AM/PM" or "H:MM AM/PM"
+  // "H:MM AM/PM"
   const ampm = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/);
   if (ampm) {
     let h = parseInt(ampm[1], 10);
@@ -121,21 +118,26 @@ function parseTimeToMinutes(timeStr) {
 
   // "HH:MM" 24-hour
   const h24 = s.match(/^(\d{1,2}):(\d{2})$/);
-  if (h24) {
-    return parseInt(h24[1], 10) * 60 + parseInt(h24[2], 10);
-  }
+  if (h24) return parseInt(h24[1], 10) * 60 + parseInt(h24[2], 10);
 
   // "5PM" / "5 PM"
   const compact = s.match(/^(\d{1,2})\s*(AM|PM)$/);
   if (compact) {
     let h = parseInt(compact[1], 10);
-    const period = compact[2];
-    if (period === "AM" && h === 12) h = 0;
-    if (period === "PM" && h !== 12) h += 12;
+    if (compact[2] === "AM" && h === 12) h = 0;
+    if (compact[2] === "PM" && h !== 12) h += 12;
     return h * 60;
   }
 
   return null;
+}
+
+function minutesToTimeStr(m) {
+  const h = Math.floor(m / 60);
+  const min = m % 60;
+  const ampm = h < 12 ? "AM" : "PM";
+  const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+  return `${h12}:${String(min).padStart(2, "0")} ${ampm}`;
 }
 
 // ============================================================
@@ -238,18 +240,14 @@ async function setTextInput(inputLocator, value) {
 }
 
 async function readNgbTypeaheadOptions(page) {
-  const window = page
-    .locator("ngb-typeahead-window.dropdown-menu.show")
-    .first();
-  const options = window.locator("button.dropdown-item");
+  const win = page.locator("ngb-typeahead-window.dropdown-menu.show").first();
+  const options = win.locator("button.dropdown-item");
   const count = await options.count().catch(() => 0);
   if (!count) return [];
   const texts = [];
   for (let i = 0; i < count; i++) {
     const t = await options.nth(i).innerText().catch(() => "");
-    const cleaned = String(t || "")
-      .replace(/\s+/g, " ")
-      .trim();
+    const cleaned = String(t || "").replace(/\s+/g, " ").trim();
     if (cleaned) texts.push(cleaned);
   }
   return texts;
@@ -274,309 +272,258 @@ async function scrapeTypeaheadUniverse(inputLocator, page) {
 }
 
 // ============================================================
-// DATE NAVIGATION HELPER
+// DATE NAVIGATION
 // ============================================================
-// Navigates the SalonBiz appointment book to a specific date.
-// SalonBiz uses a date picker in the top bar. We try several
-// strategies in order:
-//   1. URL query param  ?date=YYYY-MM-DD  (works on some versions)
-//   2. Click the date header and type into the date picker input
-//   3. Click forward/back arrows until the correct date is shown
-//
-// After navigation, waits for the stylist column headers to load.
-async function navigateToDate(page, dateStr) {
-  // dateStr = "YYYY-MM-DD"
-  // Strategy 1: append ?date= to URL
-  const urlWithDate = `${SALONBIZ_BASE_URL}/appointmentbook?date=${dateStr}`;
-  await page.goto(urlWithDate, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(3000);
-
-  // Check if the page is showing the correct date by reading the
-  // displayed date text in the top bar.
-  const displayedDate = await readDisplayedDate(page);
-  if (displayedDate === dateStr) return;
-
-  // Strategy 2: Find the date input in the top bar and type the date.
-  // SalonBiz renders a date picker near the navigation arrows.
-  const datePickerSelectors = [
-    'input[formcontrolname="date"]',
-    'input[type="date"]',
-    ".sbiz-datepicker input",
-    "sbiz-date-picker input",
-    '[placeholder*="date" i]',
-    '[aria-label*="date" i]',
-  ];
-
-  for (const sel of datePickerSelectors) {
-    const inp = page.locator(sel).first();
-    const exists = (await inp.count().catch(() => 0)) > 0;
-    if (!exists) continue;
-    const visible = await inp.isVisible().catch(() => false);
-    if (!visible) continue;
-
-    await inp.click({ timeout: 10000 });
-    await page.keyboard.press("Control+a");
-    await page.keyboard.type(dateStr, { delay: 30 });
-    await page.keyboard.press("Enter");
-    await page.waitForTimeout(2500);
-
-    const d2 = await readDisplayedDate(page);
-    if (d2 === dateStr) return;
-    break;
-  }
-
-  // Strategy 3: Click the navigation arrows to step to the target date.
-  // This is the most reliable but slowest fallback.
-  await stepToDateViaArrows(page, dateStr);
-}
-
-// Reads the currently-displayed date from the appointment book header.
-// Returns "YYYY-MM-DD" or "" if it can't be determined.
 async function readDisplayedDate(page) {
-  // Try to find a date display element. SalonBiz typically shows
-  // something like "May 23, 2026" or "05/23/2026" in a header.
   const candidates = [
     'sbiz-date-picker input[type="date"]',
     'sbiz-date-picker input',
     'input[formcontrolname="date"]',
     ".appointment-book-date",
     ".sbiz-calendar-header .date",
-    "[data-testid='current-date']",
   ];
-
   for (const sel of candidates) {
     const el = page.locator(sel).first();
-    const count = await el.count().catch(() => 0);
-    if (!count) continue;
-    const val = await el.inputValue().catch(async () => el.innerText().catch(() => ""));
-    if (val) {
-      // Try to parse as YYYY-MM-DD directly
-      if (/^\d{4}-\d{2}-\d{2}$/.test(val.trim())) return val.trim();
-      // Try MM/DD/YYYY
-      const mdy = val.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-      if (mdy)
-        return `${mdy[3]}-${mdy[1].padStart(2, "0")}-${mdy[2].padStart(2, "0")}`;
-    }
+    if ((await el.count().catch(() => 0)) === 0) continue;
+    const val = await el
+      .inputValue()
+      .catch(async () => el.innerText().catch(() => ""));
+    if (!val) continue;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(val.trim())) return val.trim();
+    const mdy = val.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (mdy)
+      return `${mdy[3]}-${mdy[1].padStart(2, "0")}-${mdy[2].padStart(2, "0")}`;
   }
   return "";
 }
 
-// Steps forward or backward one day at a time using the nav arrows.
-// Gives up after 14 steps in either direction.
 async function stepToDateViaArrows(page, targetDateStr) {
   const target = new Date(targetDateStr + "T12:00:00");
-  const MAX_STEPS = 14;
-
-  // Arrow button selectors (prev / next)
   const prevSel = [
     'button[aria-label*="previous" i]',
     'button[aria-label*="prev" i]',
     ".sbiz-prev-day",
     ".prev-day",
-    "button.prev",
-    'button:has-text("<")',
   ].join(", ");
   const nextSel = [
     'button[aria-label*="next" i]',
     ".sbiz-next-day",
     ".next-day",
-    "button.next",
-    'button:has-text(">")',
   ].join(", ");
 
-  for (let step = 0; step < MAX_STEPS; step++) {
+  for (let step = 0; step < 14; step++) {
     const current = await readDisplayedDate(page);
     if (current === targetDateStr) return;
+    if (!current) return;
 
-    if (!current) {
-      // Can't read date — give up
-      return;
-    }
-
-    const currentDate = new Date(current + "T12:00:00");
-    const diff = target - currentDate; // ms
-
+    const diff = target - new Date(current + "T12:00:00");
     if (diff > 0) {
-      // Need to go forward
       const btn = page.locator(nextSel).first();
-      const v = await btn.isVisible().catch(() => false);
-      if (!v) return;
+      if (!(await btn.isVisible().catch(() => false))) return;
       await btn.click({ timeout: 10000 });
     } else {
-      // Need to go backward
       const btn = page.locator(prevSel).first();
-      const v = await btn.isVisible().catch(() => false);
-      if (!v) return;
+      if (!(await btn.isVisible().catch(() => false))) return;
       await btn.click({ timeout: 10000 });
     }
-
     await page.waitForTimeout(1500);
   }
+}
+
+async function navigateToDate(page, dateStr) {
+  await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook?date=${dateStr}`, {
+    waitUntil: "domcontentloaded",
+  });
+  await page.waitForTimeout(3000);
+
+  if ((await readDisplayedDate(page)) === dateStr) return;
+
+  const datePickerSelectors = [
+    'input[formcontrolname="date"]',
+    'input[type="date"]',
+    ".sbiz-datepicker input",
+    "sbiz-date-picker input",
+  ];
+  for (const sel of datePickerSelectors) {
+    const inp = page.locator(sel).first();
+    if ((await inp.count().catch(() => 0)) === 0) continue;
+    if (!(await inp.isVisible().catch(() => false))) continue;
+    await inp.click({ timeout: 10000 });
+    await page.keyboard.press("Control+a");
+    await page.keyboard.type(dateStr, { delay: 30 });
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(2500);
+    if ((await readDisplayedDate(page)) === dateStr) return;
+    break;
+  }
+
+  await stepToDateViaArrows(page, dateStr);
+}
+
+// ============================================================
+// TIME MAP — pixel Y → minutes since midnight
+// ============================================================
+async function buildTimeMap(page) {
+  const timeLabels = [];
+  const selectors = [
+    ".time-label",
+    ".sbiz-time-label",
+    "[class*='time-label']",
+    "[class*='time-slot-label']",
+    "sbiz-time-column span",
+    "sbiz-time-column div",
+  ];
+
+  for (const sel of selectors) {
+    const els = await page.locator(sel).all().catch(() => []);
+    if (els.length < 2) continue;
+    for (const el of els) {
+      const text = await el.innerText().catch(() => "");
+      const minutes = parseTimeToMinutes(text.trim());
+      if (minutes === null) continue;
+      const bb = await el.boundingBox().catch(() => null);
+      if (!bb) continue;
+      timeLabels.push({ minutes, y: bb.y + bb.height / 2 });
+    }
+    if (timeLabels.length >= 2) break;
+  }
+
+  timeLabels.sort((a, b) => a.y - b.y);
+  return timeLabels;
+}
+
+function pixelToMinutes(y, timeMap) {
+  if (!timeMap || timeMap.length < 2) return null;
+
+  if (y >= timeMap[timeMap.length - 1].y) {
+    const a = timeMap[timeMap.length - 2];
+    const b = timeMap[timeMap.length - 1];
+    return Math.round(a.minutes + ((y - a.y) / (b.y - a.y)) * (b.minutes - a.minutes));
+  }
+  if (y <= timeMap[0].y) {
+    const a = timeMap[0];
+    const b = timeMap[1];
+    return Math.round(a.minutes + ((y - a.y) / (b.y - a.y)) * (b.minutes - a.minutes));
+  }
+  for (let i = 0; i < timeMap.length - 1; i++) {
+    const a = timeMap[i];
+    const b = timeMap[i + 1];
+    if (y >= a.y && y <= b.y) {
+      return Math.round(a.minutes + ((y - a.y) / (b.y - a.y)) * (b.minutes - a.minutes));
+    }
+  }
+  return null;
 }
 
 // ============================================================
 // CORE SCHEDULE SCRAPER
 // ============================================================
-// This is the main new function. It reads the appointment book
-// for a specific date and returns a schedule map:
+// Reads the SalonBiz appointment book for a specific date.
+// Returns: { [stylistFirstName]: { isWorking, notWorkingPeriods, rawName } }
 //
-//   {
-//     "Daniela": { isWorking: true,  notWorkingPeriods: [] },
-//     "Kendra":  { isWorking: false, notWorkingPeriods: [{ startMin: 0, endMin: 1439 }] },
-//     ...
-//   }
-//
-// HOW IT WORKS:
-//   - Each stylist column is identified by sbiz-provider-column or
-//     similar container with a header showing the stylist name.
-//   - Inside each column, we look for blocks that contain both
-//     "blocked" (case-insensitive) AND "not working" text.
-//   - If a "Not Working" block spans a large fraction of the day
-//     (or the whole day) we mark isWorking = false.
-//   - We also record the pixel position of each "Not Working" block
-//     relative to the column so we can check specific time slots.
-//   - The time ruler on the left (or inside each column) provides
-//     the mapping from pixel position → time.
-//
-// PIXEL-TO-TIME MAPPING:
-//   SalonBiz renders the appointment book as a scrollable grid.
-//   The left side shows time labels (e.g. "9:00 am", "9:15", ...).
-//   We read those label positions to build a px-per-minute ratio,
-//   then use that to convert block top/height → start/end minutes.
-//
+// "Not Working" detection:
+//   - Looks for DOM elements containing "not working" text (case-insensitive)
+//   - Maps their pixel position to time using the time ruler
+//   - A stylist is marked isWorking=false if their Not Working blocks
+//     cover 4+ hours total
 async function scrapeScheduleForDate(page, dateStr) {
-  // Navigate to the correct date
   await navigateToDate(page, dateStr);
   await page.waitForTimeout(2000);
 
-  // ---- Step 1: Build a pixel → minutes map from time labels ----
-  // We look for all visible time labels in the appointment grid.
   const timeMap = await buildTimeMap(page);
 
-  // ---- Step 2: Read each stylist column ----
-  // SalonBiz column headers contain the stylist's name.
-  // We find all column header elements and their bounding boxes,
-  // then for each column we find "Not Working" blocks inside it.
+  const schedule = {};
 
-  const schedule = {}; // stylistFirstName → { isWorking, notWorkingPeriods }
-
-  // Try to find the column container. SalonBiz uses various component names.
+  // Try named column components first
   const columnSelectors = [
     "sbiz-provider-column",
     ".provider-column",
     ".stylist-column",
     "[class*='provider-col']",
-    "[class*='stylist-col']",
   ];
 
   let columnEls = null;
   for (const sel of columnSelectors) {
-    const count = await page.locator(sel).count().catch(() => 0);
-    if (count > 0) {
+    if ((await page.locator(sel).count().catch(() => 0)) > 0) {
       columnEls = page.locator(sel);
       break;
     }
   }
 
-  if (!columnEls) {
-    // Fallback: try to extract schedule data from DOM text only
-    return await scrapeScheduleFallback(page, timeMap);
-  }
+  if (columnEls) {
+    const colCount = await columnEls.count();
+    for (let i = 0; i < colCount; i++) {
+      const col = columnEls.nth(i);
+      const rawName = await col
+        .locator(
+          ".provider-name, .stylist-name, sbiz-provider-header, " +
+          "[class*='provider-name'], h4, h3, .name"
+        )
+        .first()
+        .innerText()
+        .catch(() => "");
+      const firstName = String(rawName || "").trim().split(/\s+/)[0];
+      if (!firstName) continue;
+      if (rawName.toLowerCase().includes("head spa")) continue;
 
-  const colCount = await columnEls.count();
-
-  for (let i = 0; i < colCount; i++) {
-    const col = columnEls.nth(i);
-
-    // Read stylist name from the column header
-    const rawName = await col
-      .locator(
-        ".provider-name, .stylist-name, sbiz-provider-header, " +
-        "[class*='provider-name'], [class*='header'] .name, " +
-        "h4, h3, .name, [class*='name']"
-      )
-      .first()
-      .innerText()
-      .catch(() => "");
-
-    const firstName = String(rawName || "").trim().split(/\s+/)[0];
-    if (!firstName) continue;
-
-    // Skip Head Spa room
-    if (rawName.toLowerCase().includes("head spa")) continue;
-
-    // Find "Not Working" / blocked blocks inside this column
-    const notWorkingBlocks = await col
-      .locator(
-        ":text-matches('not working', 'i'), " +
-        "[class*='blocked']:has-text('Not Working'), " +
-        ".sbiz-block:has-text('Not Working'), " +
-        "div:has-text('Not Working')"
-      )
-      .all()
-      .catch(() => []);
-
-    const notWorkingPeriods = [];
-
-    for (const block of notWorkingBlocks) {
-      // Confirm it really says "Not Working" (not just partial match)
-      const blockText = await block.innerText().catch(() => "");
-      if (!/not working/i.test(blockText)) continue;
-
-      // Get bounding box of the block relative to the page
-      const bb = await block.boundingBox().catch(() => null);
-      if (!bb) continue;
-
-      // Convert pixel positions to minutes using timeMap
-      const startMin = pixelToMinutes(bb.y, timeMap);
-      const endMin = pixelToMinutes(bb.y + bb.height, timeMap);
-
-      if (startMin !== null && endMin !== null) {
-        notWorkingPeriods.push({ startMin, endMin });
-      }
+      const notWorkingPeriods = await extractNotWorkingPeriods(col, timeMap);
+      const totalBlockedMinutes = notWorkingPeriods.reduce(
+        (sum, p) => sum + Math.max(0, p.endMin - p.startMin), 0
+      );
+      schedule[firstName] = {
+        isWorking: notWorkingPeriods.length === 0 || totalBlockedMinutes < 4 * 60,
+        notWorkingPeriods,
+        rawName: rawName.trim(),
+      };
     }
-
-    // A stylist is considered "not working" for the whole day if
-    // there's a Not Working block that covers 4+ hours of time,
-    // OR if the total blocked time covers more than 50% of an 8-hour day.
-    const totalBlockedMinutes = notWorkingPeriods.reduce(
-      (sum, p) => sum + Math.max(0, p.endMin - p.startMin),
-      0
-    );
-    const isWorking =
-      notWorkingPeriods.length === 0 || totalBlockedMinutes < 4 * 60;
-
-    schedule[firstName] = { isWorking, notWorkingPeriods, rawName };
+  } else {
+    // Fallback: match Not Working blocks to column headers by X position
+    await scrapeScheduleFallback(page, timeMap, schedule);
   }
 
   return schedule;
 }
 
-// ============================================================
-// FALLBACK SCHEDULE SCRAPER (no column components found)
-// ============================================================
-// If we can't find sbiz-provider-column elements, we fall back to
-// reading the DOM text to find "Not Working" mentions and which
-// stylist column they belong to.
-async function scrapeScheduleFallback(page, timeMap) {
-  const schedule = {};
+async function extractNotWorkingPeriods(columnLocator, timeMap) {
+  const periods = [];
+  const blocks = await columnLocator
+    .locator("div")
+    .all()
+    .catch(() => []);
 
-  // Get all header cells (stylist names in the top row)
+  for (const block of blocks) {
+    const text = await block.innerText().catch(() => "");
+    if (!/not working/i.test(text)) continue;
+    const bb = await block.boundingBox().catch(() => null);
+    if (!bb || bb.height < 5) continue;
+    const startMin = pixelToMinutes(bb.y, timeMap);
+    const endMin = pixelToMinutes(bb.y + bb.height, timeMap);
+    if (startMin !== null && endMin !== null && endMin > startMin) {
+      periods.push({ startMin, endMin });
+    }
+  }
+  return periods;
+}
+
+async function scrapeScheduleFallback(page, timeMap, schedule) {
   const headers = await page
     .locator(
-      "sbiz-provider-header, .provider-header, " +
-      "thead th .name, [class*='column-header']"
+      "sbiz-provider-header, .provider-header, [class*='column-header'], " +
+      "thead th .name"
     )
     .all()
     .catch(() => []);
 
-  // Get all "Not Working" blocks anywhere on the page
-  const nwBlocks = await page
-    .locator("div:has-text('Not Working')")
-    .all()
-    .catch(() => []);
+  const nwBlocks = await page.locator("div").all().catch(() => []);
+  const nwFiltered = [];
+  for (const b of nwBlocks) {
+    const t = await b.innerText().catch(() => "");
+    if (/not working/i.test(t)) {
+      const bb = await b.boundingBox().catch(() => null);
+      if (bb && bb.height > 5) nwFiltered.push({ el: b, bb, text: t });
+    }
+  }
 
-  // For each header, find its x-range and check which NW blocks fall within it
   for (const header of headers) {
     const rawName = await header.innerText().catch(() => "");
     const firstName = String(rawName || "").trim().split(/\s+/)[0];
@@ -587,144 +534,41 @@ async function scrapeScheduleFallback(page, timeMap) {
     if (!hbb) continue;
 
     const notWorkingPeriods = [];
-
-    for (const block of nwBlocks) {
-      const blockText = await block.innerText().catch(() => "");
-      if (!/not working/i.test(blockText)) continue;
-
-      const bb = await block.boundingBox().catch(() => null);
-      if (!bb) continue;
-
-      // Check if block's x center falls within the header's x range
-      const blockCenterX = bb.x + bb.width / 2;
-      if (
-        blockCenterX >= hbb.x - 5 &&
-        blockCenterX <= hbb.x + hbb.width + 5
-      ) {
+    for (const { bb } of nwFiltered) {
+      const cx = bb.x + bb.width / 2;
+      if (cx >= hbb.x - 5 && cx <= hbb.x + hbb.width + 5) {
         const startMin = pixelToMinutes(bb.y, timeMap);
         const endMin = pixelToMinutes(bb.y + bb.height, timeMap);
-        if (startMin !== null && endMin !== null) {
+        if (startMin !== null && endMin !== null && endMin > startMin) {
           notWorkingPeriods.push({ startMin, endMin });
         }
       }
     }
 
     const totalBlockedMinutes = notWorkingPeriods.reduce(
-      (sum, p) => sum + Math.max(0, p.endMin - p.startMin),
-      0
+      (sum, p) => sum + Math.max(0, p.endMin - p.startMin), 0
     );
-    const isWorking =
-      notWorkingPeriods.length === 0 || totalBlockedMinutes < 4 * 60;
-
-    schedule[firstName] = { isWorking, notWorkingPeriods, rawName };
+    schedule[firstName] = {
+      isWorking: notWorkingPeriods.length === 0 || totalBlockedMinutes < 4 * 60,
+      notWorkingPeriods,
+      rawName: rawName.trim(),
+    };
   }
-
-  return schedule;
-}
-
-// ============================================================
-// TIME MAP BUILDER
-// ============================================================
-// Reads the time labels on the left side of the appointment book
-// (e.g. "9:00 am", "9:30 am", ...) and builds a sorted array of
-// { minutes, y } pairs used to convert pixel Y → time in minutes.
-async function buildTimeMap(page) {
-  const timeLabels = [];
-
-  // SalonBiz renders time labels in various ways
-  const timeLabelSelectors = [
-    ".time-label",
-    ".sbiz-time-label",
-    "[class*='time-label']",
-    "[class*='time-slot-label']",
-    ".hour-label",
-    "sbiz-time-column span",
-    "sbiz-time-column div",
-    ".appointment-time",
-  ];
-
-  for (const sel of timeLabelSelectors) {
-    const els = await page.locator(sel).all().catch(() => []);
-    if (els.length < 2) continue;
-
-    for (const el of els) {
-      const text = await el.innerText().catch(() => "");
-      const minutes = parseTimeToMinutes(text.trim());
-      if (minutes === null) continue;
-
-      const bb = await el.boundingBox().catch(() => null);
-      if (!bb) continue;
-
-      timeLabels.push({ minutes, y: bb.y + bb.height / 2 });
-    }
-
-    if (timeLabels.length >= 2) break;
-  }
-
-  // Sort by y position
-  timeLabels.sort((a, b) => a.y - b.y);
-  return timeLabels;
-}
-
-// ============================================================
-// PIXEL → MINUTES CONVERTER
-// ============================================================
-// Given a Y pixel and a timeMap (sorted array of {y, minutes}),
-// interpolates to find the time in minutes since midnight.
-function pixelToMinutes(y, timeMap) {
-  if (!timeMap || timeMap.length < 2) return null;
-
-  // Below all known points — extrapolate from last two
-  if (y >= timeMap[timeMap.length - 1].y) {
-    const a = timeMap[timeMap.length - 2];
-    const b = timeMap[timeMap.length - 1];
-    const ratio = (y - a.y) / (b.y - a.y);
-    return Math.round(a.minutes + ratio * (b.minutes - a.minutes));
-  }
-
-  // Above all known points — extrapolate from first two
-  if (y <= timeMap[0].y) {
-    const a = timeMap[0];
-    const b = timeMap[1];
-    const ratio = (y - a.y) / (b.y - a.y);
-    return Math.round(a.minutes + ratio * (b.minutes - a.minutes));
-  }
-
-  // Interpolate between surrounding points
-  for (let i = 0; i < timeMap.length - 1; i++) {
-    const a = timeMap[i];
-    const b = timeMap[i + 1];
-    if (y >= a.y && y <= b.y) {
-      const ratio = (y - a.y) / (b.y - a.y);
-      return Math.round(a.minutes + ratio * (b.minutes - a.minutes));
-    }
-  }
-
-  return null;
 }
 
 // ============================================================
 // SCHEDULE AVAILABILITY CHECK
 // ============================================================
-// Given a scheduleMap and a requested time string, checks if the
-// stylist is working AND the requested time is not in a "Not Working"
-// period.
-//
-// Returns: { available: true } or { available: false, reason: string }
 function checkStylistAvailability(scheduleMap, stylistFirstName, startTimeStr) {
   if (!scheduleMap || !stylistFirstName) {
-    // No schedule data — can't check, assume available
     return { available: true, reason: "no schedule data" };
   }
 
-  // Case-insensitive lookup
   const key = Object.keys(scheduleMap).find(
     (k) => k.toLowerCase() === stylistFirstName.toLowerCase()
   );
 
   if (!key) {
-    // Stylist not found in schedule — may mean they aren't on the
-    // appointment book at all that day (completely off)
     return {
       available: false,
       reason: `${stylistFirstName} does not appear on the schedule for that day.`,
@@ -740,21 +584,13 @@ function checkStylistAvailability(scheduleMap, stylistFirstName, startTimeStr) {
     };
   }
 
-  // Check if the requested time falls in any Not Working period
   const requestedMin = parseTimeToMinutes(startTimeStr);
-  if (requestedMin !== null && entry.notWorkingPeriods.length > 0) {
+  if (requestedMin !== null) {
     for (const period of entry.notWorkingPeriods) {
       if (requestedMin >= period.startMin && requestedMin < period.endMin) {
-        const fmt = (m) => {
-          const h = Math.floor(m / 60);
-          const min = m % 60;
-          const ampm = h < 12 ? "AM" : "PM";
-          const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
-          return `${h12}:${String(min).padStart(2, "0")} ${ampm}`;
-        };
         return {
           available: false,
-          reason: `${stylistFirstName} is not working at ${startTimeStr} (blocked ${fmt(period.startMin)}–${fmt(period.endMin)}).`,
+          reason: `${stylistFirstName} is not working at ${startTimeStr} (blocked ${minutesToTimeStr(period.startMin)}–${minutesToTimeStr(period.endMin)}).`,
         };
       }
     }
@@ -769,7 +605,11 @@ function checkStylistAvailability(scheduleMap, stylistFirstName, startTimeStr) {
 async function getScheduleCached(dateStr) {
   const entry = scheduleCache.get(dateStr);
   if (!scheduleExpired(entry)) {
-    return { schedule: entry.data, cached: true, cacheAgeMs: Date.now() - entry.fetchedAt };
+    return {
+      schedule: entry.data,
+      cached: true,
+      cacheAgeMs: Date.now() - entry.fetchedAt,
+    };
   }
 
   const browser = await chromium.launch({
@@ -782,7 +622,6 @@ async function getScheduleCached(dateStr) {
     if (cookiesExpired()) cookieState = null;
     await loginIfNeeded(page);
     await saveCookies(context);
-
     const data = await scrapeScheduleForDate(page, dateStr);
     scheduleCache.set(dateStr, { fetchedAt: Date.now(), data });
     return { schedule: data, cached: false, cacheAgeMs: 0 };
@@ -793,7 +632,7 @@ async function getScheduleCached(dateStr) {
 }
 
 // ============================================================
-// STYLIST CACHE (unchanged from original)
+// STYLIST CACHE
 // ============================================================
 async function fetchStylistsFromSalonBiz() {
   const browser = await chromium.launch({
@@ -802,7 +641,6 @@ async function fetchStylistsFromSalonBiz() {
   });
   const { context, page } = await getPage(browser);
   let step = "start";
-
   try {
     if (cookiesExpired()) cookieState = null;
     step = "login";
@@ -822,15 +660,12 @@ async function fetchStylistsFromSalonBiz() {
       .locator('input[formcontrolname="staff"]')
       .first();
     await staffInput.waitFor({ state: "visible", timeout: 20000 });
-
     const stylistsRaw = await scrapeTypeaheadUniverse(staffInput, page);
+
     const filtered = stylistsRaw.filter((name) => {
       const n = String(name || "").trim().toLowerCase();
-      if (!n) return false;
-      if (n.includes("head spa")) return false;
-      return true;
+      return n && !n.includes("head spa");
     });
-
     const cleaned = filtered
       .map((name) => String(name).trim().split(/\s+/)[0])
       .filter(Boolean);
@@ -849,15 +684,8 @@ async function fetchStylistsFromSalonBiz() {
 
 async function getStylistsCached() {
   const now = Date.now();
-  if (
-    stylistCache.value &&
-    now - stylistCache.fetchedAt < STYLIST_CACHE_TTL_MS
-  ) {
-    return {
-      stylists: stylistCache.value,
-      cached: true,
-      cacheAgeMs: now - stylistCache.fetchedAt,
-    };
+  if (stylistCache.value && now - stylistCache.fetchedAt < STYLIST_CACHE_TTL_MS) {
+    return { stylists: stylistCache.value, cached: true, cacheAgeMs: now - stylistCache.fetchedAt };
   }
   const stylists = await fetchStylistsFromSalonBiz();
   stylistCache = { value: stylists, fetchedAt: now };
@@ -865,7 +693,7 @@ async function getStylistsCached() {
 }
 
 // ============================================================
-// VAPI HELPERS (unchanged)
+// VAPI HELPERS
 // ============================================================
 function extractToolCall(req) {
   return (
@@ -874,42 +702,32 @@ function extractToolCall(req) {
     null
   );
 }
-
 function extractToolCallId(req) {
   return extractToolCall(req)?.id || null;
 }
-
 function extractArgs(req) {
   const toolCall = extractToolCall(req);
   const raw = toolCall?.function?.arguments;
   if (raw && typeof raw === "object") return raw;
   if (typeof raw === "string") {
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return {};
-    }
+    try { return JSON.parse(raw); } catch { return {}; }
   }
   return {};
 }
-
 function vapiRespond(res, toolCallId, result, statusCode = 200) {
   return res.status(statusCode).json({ results: [{ toolCallId, result }] });
 }
-
 function vapiError(res, toolCallId, message, statusCode = 400) {
   return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
 // ============================================================
-// BOOKING JOB STORE (unchanged)
+// BOOKING JOB STORE
 // ============================================================
 const bookingJobs = new Map();
-
 function newJobId() {
   return `job_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
-
 setInterval(() => {
   const now = Date.now();
   for (const [jobId, job] of bookingJobs.entries()) {
@@ -918,7 +736,7 @@ setInterval(() => {
 }, 1000 * 60).unref?.();
 
 // ============================================================
-// DATE INPUT HELPER (unchanged)
+// DATE INPUT HELPER (booking panel)
 // ============================================================
 const DATE_INPUT_SELECTOR =
   process.env.DATE_INPUT_SELECTOR ||
@@ -926,4 +744,189 @@ const DATE_INPUT_SELECTOR =
   'sbiz-book-right-panel input[formcontrolname="date"], ' +
   'sbiz-book-right-panel input[type="date"]';
 
-async function setAppointmentDate
+async function setAppointmentDateIfPossible(page, startDate) {
+  if (!startDate) return { didSetDate: false, selectorUsed: null };
+  const dateInput = page.locator(DATE_INPUT_SELECTOR).first();
+  if ((await dateInput.count().catch(() => 0)) === 0)
+    return { didSetDate: false, selectorUsed: null };
+  await dateInput.click({ timeout: 15000 }).catch(() => {});
+  await dateInput.fill(String(startDate)).catch(() => {});
+  await dateInput.page().keyboard.press("Enter").catch(() => {});
+  await page.waitForTimeout(600);
+  return { didSetDate: true, selectorUsed: DATE_INPUT_SELECTOR };
+}
+
+// ============================================================
+// ROUTES
+// ============================================================
+app.get("/health", (req, res) =>
+  res.json({ ok: true, now: new Date().toISOString() })
+);
+app.get("/debug/ping", (req, res) => res.json({ ok: true, msg: "pong" }));
+
+// ----------------------------------------------------------
+// POST /services
+// ----------------------------------------------------------
+app.post("/services", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  if (!PHONE_BOOKABLE_SERVICES.size) {
+    return vapiError(res, toolCallId,
+      "PHONE_BOOKABLE_SERVICES env var is empty."
+    );
+  }
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+  const { context, page } = await getPage(browser);
+  let step = "start";
+  try {
+    if (cookiesExpired()) cookieState = null;
+    step = "login";
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    step = "openPanel";
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, {
+      waitUntil: "domcontentloaded",
+    });
+    await page.waitForTimeout(2500);
+    const serviceInput = await ensureCreatePanelOpen(page);
+
+    step = "scrapeServices";
+    const allServices = await scrapeTypeaheadUniverse(serviceInput, page);
+    const phoneBookable = allServices.filter((s) =>
+      PHONE_BOOKABLE_SERVICES.has(s)
+    );
+    return vapiRespond(res, toolCallId, {
+      ok: true,
+      countAll: allServices.length,
+      countPhoneBookable: phoneBookable.length,
+      services: phoneBookable,
+    });
+  } catch (e) {
+    console.error("SERVICES error at step:", step, e);
+    await page.screenshot({ path: "/tmp/services_error.png", fullPage: true }).catch(() => {});
+    return vapiRespond(res, toolCallId,
+      { ok: false, step, error: e?.message || String(e), debug: "/debug/services_error.png" },
+      500
+    );
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+});
+
+// ----------------------------------------------------------
+// POST /stylists
+// ----------------------------------------------------------
+app.post("/stylists", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  try {
+    const { stylists, cached, cacheAgeMs } = await getStylistsCached();
+    return vapiRespond(res, toolCallId, {
+      ok: true, cached, cacheAgeMs, count: stylists.length, stylists,
+    });
+  } catch (e) {
+    console.error("STYLISTS error:", e);
+    return vapiRespond(res, toolCallId,
+      { ok: false, error: e?.message || String(e), debug: "/debug/stylists_error.png" },
+      500
+    );
+  }
+});
+
+// ----------------------------------------------------------
+// POST /schedule   ← NEW ENDPOINT
+// Lists every stylist's working status for a given date.
+// Args: { date: "YYYY-MM-DD" }
+// Optionally check a specific stylist + time:
+// Args: { date, stylist, startTime }
+// ----------------------------------------------------------
+app.post("/schedule", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
+
+  const dateStr = args.date || args.startDate || formatYYYYMMDD(new Date());
+  const stylist = args.stylist || null;
+  const startTime = args.startTime || args.time || null;
+
+  try {
+    const { schedule, cached, cacheAgeMs } = await getScheduleCached(dateStr);
+
+    // Build a clean summary for the AI
+    const summary = Object.entries(schedule).map(([name, data]) => ({
+      name,
+      isWorking: data.isWorking,
+      notWorkingPeriods: data.notWorkingPeriods.map((p) => ({
+        from: minutesToTimeStr(p.startMin),
+        to: minutesToTimeStr(p.endMin),
+      })),
+    }));
+
+    // If a specific stylist + time was asked about, include availability
+    let specificCheck = null;
+    if (stylist && startTime) {
+      specificCheck = checkStylistAvailability(schedule, stylist, startTime);
+    } else if (stylist) {
+      const key = Object.keys(schedule).find(
+        (k) => k.toLowerCase() === stylist.toLowerCase()
+      );
+      if (key) {
+        specificCheck = {
+          available: schedule[key].isWorking,
+          reason: schedule[key].isWorking
+            ? `${stylist} is working that day.`
+            : `${stylist} is not working that day.`,
+        };
+      } else {
+        specificCheck = {
+          available: false,
+          reason: `${stylist} does not appear on the schedule for ${dateStr}.`,
+        };
+      }
+    }
+
+    return vapiRespond(res, toolCallId, {
+      ok: true,
+      date: dateStr,
+      cached,
+      cacheAgeMs,
+      stylistCount: summary.length,
+      schedule: summary,
+      ...(specificCheck ? { specificCheck } : {}),
+    });
+  } catch (e) {
+    console.error("SCHEDULE error:", e);
+    await (async () => {
+      // take debug screenshot if possible
+    })().catch(() => {});
+    return vapiRespond(res, toolCallId,
+      { ok: false, error: e?.message || String(e) },
+      500
+    );
+  }
+});
+
+// ----------------------------------------------------------
+// POST /availability   (updated — schedule check first)
+// ----------------------------------------------------------
+app.post("/availability", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
+
+  const service = args.service || "";
+  const stylist = args.stylist || undefined;
+  const startTime = args.startTime || args.time || "";
+  const startDate = args.startDate || formatYYYYMMDD(new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+  if (!service) return vapiError(res, toolCallId, "service required");
+  if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g. '5:00 PM')");
+
+  // ---- Step 1: Schedule check (fast, uses cache) ----
+  if (stylist) {
+    try {
+      const { schedule } = await getScheduleCached(startDate);
+      const check = checkStylistAvailability(schedule, stylist, startTime);
+      if (!check.available) {
