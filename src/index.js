@@ -29,6 +29,9 @@ const STYLIST_CACHE_TTL_MS = Number(process.env.STYLIST_CACHE_TTL_MS || 10 * 60 
 const scheduleCache = new Map();
 const SCHEDULE_CACHE_TTL_MS = Number(process.env.SCHEDULE_CACHE_TTL_MS || 5 * 60 * 1000);
 
+// How long to wait (ms) for the Playwright booking to finish before timing out
+const BOOK_TIMEOUT_MS = Number(process.env.BOOK_TIMEOUT_MS || 120000);
+
 function scheduleExpired(entry) {
   return !entry || Date.now() - entry.fetchedAt > SCHEDULE_CACHE_TTL_MS;
 }
@@ -239,11 +242,9 @@ async function stepToDateViaArrows(page, targetDateStr) {
 }
 
 async function navigateToDate(page, dateStr) {
-  // Primary: URL-based navigation
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook?date=${dateStr}`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(3000);
   if ((await readDisplayedDate(page)) === dateStr) return;
-  // Fallback: type into date picker
   const pickers = ['input[formcontrolname="date"]', 'input[type="date"]', ".sbiz-datepicker input", "sbiz-date-picker input"];
   for (const sel of pickers) {
     const inp = page.locator(sel).first();
@@ -257,11 +258,9 @@ async function navigateToDate(page, dateStr) {
     if ((await readDisplayedDate(page)) === dateStr) return;
     break;
   }
-  // Last resort: arrow buttons
   await stepToDateViaArrows(page, dateStr);
 }
 
-// Navigate to booking page for a specific date and open the create panel
 async function navigateToBookingDate(page, dateStr) {
   await navigateToDate(page, dateStr);
   await page.waitForTimeout(1000);
@@ -482,15 +481,6 @@ function vapiError(res, toolCallId, message, statusCode = 400) {
   return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
 }
 
-const bookingJobs = new Map();
-function newJobId() { return `job_${Date.now()}_${Math.random().toString(16).slice(2)}`; }
-setInterval(() => {
-  const now = Date.now();
-  for (const [jobId, job] of bookingJobs.entries()) {
-    if (now - job.createdAt > 1000 * 60 * 30) bookingJobs.delete(jobId);
-  }
-}, 1000 * 60).unref?.();
-
 // ── Booking helpers ────────────────────────────────────────────
 
 async function selectExistingClient(page, query) {
@@ -549,10 +539,6 @@ async function clickFinalAppointmentCreate(page) {
   return false;
 }
 
-/**
- * Check for blocked banner in the booking panel.
- * Returns { blocked: true, reason } or { blocked: false }
- */
 async function checkForBlockedBanner(page) {
   await page.waitForTimeout(1200);
   const blockedBanner = page.locator("text=/blocked by/i").first();
@@ -565,14 +551,11 @@ async function checkForBlockedBanner(page) {
 }
 
 /**
- * Core booking function.
- * Navigates to the correct DATE first (via URL), then opens the panel and fills fields.
- * REQUIRES startDate - will throw if missing.
+ * Core booking function - runs the full Playwright booking flow.
  */
 async function runBooking(page, { isNewClient, customerName, customerPhone, customerEmail, service, stylist, startTime, startDate, customDuration, requestReason }) {
   if (!startDate) throw new Error("startDate is required in YYYY-MM-DD format");
 
-  // Navigate to the exact date - this is the KEY fix
   await navigateToBookingDate(page, startDate);
 
   if (isNewClient) {
@@ -583,28 +566,15 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
   }
 
   const panel = page.locator("sbiz-book-right-panel");
-
-  // Fill in service
   await typeaheadSelect(panel.locator('input[formcontrolname="service"]').first(), service);
-
-  // Fill in stylist
   if (stylist) await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
-
-  // Fill in time
   await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
-
-  // Fill in duration
   await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
-
-  // Fill in notes/reason if provided
   if (requestReason) {
     await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason).catch(() => {});
   }
-
-  // Scroll to make Create button visible
   await panel.evaluate(el => { const sc = el.querySelector(".scrollable"); if (sc) sc.scrollTop = sc.scrollHeight; }).catch(() => {});
 
-  // Check for blocked banner BEFORE clicking Create
   const preCheck = await checkForBlockedBanner(page);
   if (preCheck.blocked) {
     return { clickedFinalCreate: false, blocked: true, reason: preCheck.reason };
@@ -615,7 +585,6 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
     return { clickedFinalCreate: false, blocked: false };
   }
 
-  // Post-click: check again for blocked banner
   const postCheck = await checkForBlockedBanner(page);
   if (postCheck.blocked) {
     return { clickedFinalCreate: true, blocked: true, reason: postCheck.reason };
@@ -699,13 +668,6 @@ app.post("/schedule", async (req, res) => {
   }
 });
 
-/**
- * POST /availability
- * Checks if a stylist is available for a given service, time, and date.
- * Uses schedule cache (visual schedule read) as primary check.
- * Falls back to Playwright panel check (blocked banner) as secondary.
- * startDate is REQUIRED - no default to tomorrow to avoid wrong-date errors.
- */
 app.post("/availability", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -718,7 +680,6 @@ app.post("/availability", async (req, res) => {
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g. '5:00 PM')");
   if (!startDate) return vapiError(res, toolCallId, "startDate required (YYYY-MM-DD). The assistant must compute the actual date.");
 
-  // Primary check: schedule (visual read of the calendar)
   if (stylist) {
     try {
       const { schedule } = await getScheduleCached(startDate);
@@ -731,14 +692,12 @@ app.post("/availability", async (req, res) => {
     }
   }
 
-  // Secondary check: open the booking panel on the correct date and look for the blocked banner
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
   const { context, page } = await getPage(browser);
   let step = "start";
   try {
     if (cookiesExpired()) cookieState = null;
     step = "login"; await loginIfNeeded(page); await saveCookies(context);
-    // Navigate to the CORRECT date before opening panel
     step = "navigateToDate";
     await navigateToBookingDate(page, startDate);
     const panel = page.locator("sbiz-book-right-panel");
@@ -766,10 +725,13 @@ app.post("/availability", async (req, res) => {
 });
 
 /**
- * POST /book
- * Books an appointment.
- * startDate is REQUIRED. The assistant must compute the exact date (YYYY-MM-DD).
- * Returns { ok, jobId, status: "running" } immediately; poll /book/status for result.
+ * POST /book  ── SYNCHRONOUS VERSION
+ *
+ * Runs the full Playwright booking inline and returns the final result
+ * (ok:true = booked, ok:false = failed/blocked) before responding.
+ *
+ * The assistant does NOT need to poll /book/status anymore.
+ * It simply calls /book, waits for the response, then tells the customer.
  */
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
@@ -814,81 +776,97 @@ app.post("/book", async (req, res) => {
     }
   }
 
-  // ── Launch booking job ──────────────────────────────────────
-  const jobId = newJobId();
-  bookingJobs.set(jobId, { status: "running", createdAt: Date.now() });
-  vapiRespond(res, toolCallId, { ok: true, jobId, status: "running", message: "Booking in progress. Poll /book/status for the result." });
+  // ── Run booking synchronously ───────────────────────────────
+  // We set a timeout so we don't hang forever
+  const timeoutMs = BOOK_TIMEOUT_MS;
+  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+  const { context, page } = await getPage(browser);
+  let step = "start";
 
-  void (async () => {
-    const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-    const { context, page } = await getPage(browser);
-    let step = "start";
-    try {
-      if (cookiesExpired()) cookieState = null;
-      step = "login"; await loginIfNeeded(page); await saveCookies(context);
-      step = "runBooking";
-      const result = await runBooking(page, { isNewClient, customerName, customerPhone, customerEmail, service, stylist, startTime, startDate, customDuration, requestReason });
+  // Set a longer timeout on the page for the full booking flow
+  page.setDefaultTimeout(60000);
+  page.setDefaultNavigationTimeout(60000);
 
-      // Screenshot for debugging
-      await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
+  try {
+    if (cookiesExpired()) cookieState = null;
+    step = "login"; await loginIfNeeded(page); await saveCookies(context);
+    step = "runBooking";
 
-      if (result.blocked) {
-        await page.screenshot({ path: "/tmp/appt_blocked.png", fullPage: true }).catch(() => {});
-        bookingJobs.set(jobId, {
-          status: "failed",
-          createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
-          error: `Time is blocked: ${result.reason}`,
-          debugScreenshot: "/debug/appt_blocked.png"
-        });
-        return;
-      }
+    // Run with an overall timeout
+    const result = await Promise.race([
+      runBooking(page, { isNewClient, customerName, customerPhone, customerEmail, service, stylist, startTime, startDate, customDuration, requestReason }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Booking timed out after " + timeoutMs / 1000 + "s")), timeoutMs))
+    ]);
 
-      if (!result.clickedFinalCreate) {
-        await page.screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true }).catch(() => {});
-        bookingJobs.set(jobId, {
-          status: "failed",
-          createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
-          error: 'Could not find/click the FINAL appointment "Create" button.',
-          debugScreenshot: "/debug/appt_create_not_found.png"
-        });
-        return;
-      }
+    await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
 
-      bookingJobs.set(jobId, {
-        status: "succeeded",
-        createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
-        result: {
-          ok: true,
-          message: "Booked successfully",
-          debugScreenshot: "/debug/appt_after.png",
-          normalized: { isNewClient, customerName, customerPhone: digitsOnly(customerPhone), customerEmail, service, stylist, startDate, startTime, customDuration }
-        }
+    if (result.blocked) {
+      await page.screenshot({ path: "/tmp/appt_blocked.png", fullPage: true }).catch(() => {});
+      return vapiRespond(res, toolCallId, {
+        ok: false,
+        booked: false,
+        reason: `Time is blocked: ${result.reason}`,
+        message: "That time is not available. Please suggest a different time or stylist.",
+        debugScreenshot: "/debug/appt_blocked.png"
       });
-    } catch (e) {
-      console.error("BOOK error at step:", step, e);
-      await page.screenshot({ path: "/tmp/book_error.png", fullPage: true }).catch(() => {});
-      bookingJobs.set(jobId, {
-        status: "failed",
-        createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
-        error: `${step}: ${e?.message || String(e)}`,
-        debugScreenshot: "/debug/book_error.png"
-      });
-    } finally {
-      await context.close().catch(() => {}); await browser.close().catch(() => {});
     }
-  })();
+
+    if (!result.clickedFinalCreate) {
+      await page.screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true }).catch(() => {});
+      return vapiRespond(res, toolCallId, {
+        ok: false,
+        booked: false,
+        reason: "Could not find the Create button in SalonBiz.",
+        message: "Something went wrong placing the booking. Please try again.",
+        debugScreenshot: "/debug/appt_create_not_found.png"
+      });
+    }
+
+    // Success!
+    return vapiRespond(res, toolCallId, {
+      ok: true,
+      booked: true,
+      message: "Appointment booked successfully.",
+      details: {
+        customerName,
+        customerPhone: digitsOnly(customerPhone),
+        customerEmail,
+        service,
+        stylist: stylist || "any",
+        startDate,
+        startTime,
+        customDuration,
+        isNewClient
+      },
+      debugScreenshot: "/debug/appt_after.png"
+    });
+
+  } catch (e) {
+    console.error("BOOK error at step:", step, e);
+    await page.screenshot({ path: "/tmp/book_error.png", fullPage: true }).catch(() => {});
+    return vapiRespond(res, toolCallId, {
+      ok: false,
+      booked: false,
+      reason: `${step}: ${e?.message || String(e)}`,
+      message: "Something went wrong while booking. Please try again or call back.",
+      debugScreenshot: "/debug/book_error.png"
+    }, 500);
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
 });
 
+// ── Legacy /book/status route (kept for compatibility) ─────────
 app.post("/book/status", async (req, res) => {
   const toolCallId = extractToolCallId(req);
-  const args = extractArgs(req);
-  const jobId = args.jobId;
-  if (!jobId) return vapiError(res, toolCallId, "jobId required");
-  const job = bookingJobs.get(jobId);
-  if (!job) return vapiRespond(res, toolCallId, { ok: false, jobId, status: "not_found", message: "Booking job not found. Do not confirm. Try again." });
-  if (job.status === "running") return vapiRespond(res, toolCallId, { ok: false, jobId, status: "running", message: "Still booking. Do not confirm yet. Keep polling." });
-  if (job.status === "failed") return vapiRespond(res, toolCallId, { ok: false, jobId, status: "failed", error: job.error || "Booking failed", debugScreenshot: job.debugScreenshot, message: "Booking failed. Do not confirm. Ask for an alternate time/service." });
-  return vapiRespond(res, toolCallId, { ok: true, jobId, status: "succeeded", result: job.result, debugScreenshot: job.debugScreenshot, message: "Booking succeeded. You may confirm the appointment now." });
+  // With the new synchronous /book endpoint, polling is no longer needed.
+  // If called, just return a message explaining this.
+  return vapiRespond(res, toolCallId, {
+    ok: false,
+    status: "deprecated",
+    message: "The /book endpoint is now synchronous. No need to poll /book/status."
+  });
 });
 
 // ── Debug screenshot routes ──────────────────────────────────────
