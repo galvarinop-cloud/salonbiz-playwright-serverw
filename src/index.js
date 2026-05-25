@@ -63,6 +63,12 @@ function formatYYYYMMDD(d) {
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
 }
+function todayStr() {
+  return formatYYYYMMDD(new Date());
+}
+function tomorrowStr() {
+  return formatYYYYMMDD(new Date(Date.now() + 24 * 60 * 60 * 1000));
+}
 function parseTimeToMinutes(timeStr) {
   if (!timeStr) return null;
   const s = String(timeStr).trim().toUpperCase();
@@ -111,10 +117,10 @@ async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(2000);
-  const userSel = 'input[formcontrolname="username"]';
   const passSel = 'input[formcontrolname="password"]';
-  const submitSel = 'button[type="submit"]';
   if ((await page.locator(passSel).count()) === 0) return;
+  const userSel = 'input[formcontrolname="username"]';
+  const submitSel = 'button[type="submit"]';
   await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
   await page.waitForSelector(passSel, { state: "visible", timeout: 15000 });
   await page.evaluate(({ userSel, passSel, username, password }) => {
@@ -233,9 +239,11 @@ async function stepToDateViaArrows(page, targetDateStr) {
 }
 
 async function navigateToDate(page, dateStr) {
+  // Primary: URL-based navigation
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook?date=${dateStr}`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(3000);
   if ((await readDisplayedDate(page)) === dateStr) return;
+  // Fallback: type into date picker
   const pickers = ['input[formcontrolname="date"]', 'input[type="date"]', ".sbiz-datepicker input", "sbiz-date-picker input"];
   for (const sel of pickers) {
     const inp = page.locator(sel).first();
@@ -249,7 +257,16 @@ async function navigateToDate(page, dateStr) {
     if ((await readDisplayedDate(page)) === dateStr) return;
     break;
   }
+  // Last resort: arrow buttons
   await stepToDateViaArrows(page, dateStr);
+}
+
+// Navigate to booking page for a specific date and open the create panel
+async function navigateToBookingDate(page, dateStr) {
+  await navigateToDate(page, dateStr);
+  await page.waitForTimeout(1000);
+  await ensureCreatePanelOpen(page);
+  await page.waitForTimeout(800);
 }
 
 async function buildTimeMap(page) {
@@ -474,151 +491,7 @@ setInterval(() => {
   }
 }, 1000 * 60).unref?.();
 
-const DATE_INPUT_SELECTOR = process.env.DATE_INPUT_SELECTOR ||
-  'sbiz-book-right-panel input[formcontrolname="startDate"], sbiz-book-right-panel input[formcontrolname="date"], sbiz-book-right-panel input[type="date"]';
-
-async function setAppointmentDateIfPossible(page, startDate) {
-  if (!startDate) return { didSetDate: false, selectorUsed: null };
-  const dateInput = page.locator(DATE_INPUT_SELECTOR).first();
-  if ((await dateInput.count().catch(() => 0)) === 0) return { didSetDate: false, selectorUsed: null };
-  await dateInput.click({ timeout: 15000 }).catch(() => {});
-  await dateInput.fill(String(startDate)).catch(() => {});
-  await dateInput.page().keyboard.press("Enter").catch(() => {});
-  await page.waitForTimeout(600);
-  return { didSetDate: true, selectorUsed: DATE_INPUT_SELECTOR };
-}
-
-app.get("/health", (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
-app.get("/debug/ping", (req, res) => res.json({ ok: true, msg: "pong" }));
-
-app.post("/services", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  if (!PHONE_BOOKABLE_SERVICES.size) return vapiError(res, toolCallId, "PHONE_BOOKABLE_SERVICES env var is empty.");
-  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-  const { context, page } = await getPage(browser);
-  let step = "start";
-  try {
-    if (cookiesExpired()) cookieState = null;
-    step = "login"; await loginIfNeeded(page); await saveCookies(context);
-    step = "openPanel";
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(2500);
-    const serviceInput = await ensureCreatePanelOpen(page);
-    step = "scrapeServices";
-    const allServices = await scrapeTypeaheadUniverse(serviceInput, page);
-    const phoneBookable = allServices.filter(s => PHONE_BOOKABLE_SERVICES.has(s));
-    return vapiRespond(res, toolCallId, { ok: true, countAll: allServices.length, countPhoneBookable: phoneBookable.length, services: phoneBookable });
-  } catch (e) {
-    console.error("SERVICES error at step:", step, e);
-    await page.screenshot({ path: "/tmp/services_error.png", fullPage: true }).catch(() => {});
-    return vapiRespond(res, toolCallId, { ok: false, step, error: e?.message || String(e), debug: "/debug/services_error.png" }, 500);
-  } finally {
-    await context.close().catch(() => {}); await browser.close().catch(() => {});
-  }
-});
-
-app.post("/stylists", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  try {
-    const { stylists, cached, cacheAgeMs } = await getStylistsCached();
-    return vapiRespond(res, toolCallId, { ok: true, cached, cacheAgeMs, count: stylists.length, stylists });
-  } catch (e) {
-    console.error("STYLISTS error:", e);
-    return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e), debug: "/debug/stylists_error.png" }, 500);
-  }
-});
-
-app.post("/schedule", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  const args = extractArgs(req);
-  const dateStr = args.date || args.startDate || formatYYYYMMDD(new Date());
-  const stylist = args.stylist || null;
-  const startTime = args.startTime || args.time || null;
-  try {
-    const { schedule, cached, cacheAgeMs } = await getScheduleCached(dateStr);
-    const summary = Object.entries(schedule).map(([name, data]) => ({
-      name,
-      isWorking: data.isWorking,
-      notWorkingPeriods: data.notWorkingPeriods.map(p => ({ from: minutesToTimeStr(p.startMin), to: minutesToTimeStr(p.endMin) }))
-    }));
-    let specificCheck = null;
-    if (stylist && startTime) {
-      specificCheck = checkStylistAvailability(schedule, stylist, startTime);
-    } else if (stylist) {
-      const key = Object.keys(schedule).find(k => k.toLowerCase() === stylist.toLowerCase());
-      specificCheck = key
-        ? { available: schedule[key].isWorking, reason: schedule[key].isWorking ? `${stylist} is working that day.` : `${stylist} is not working that day.` }
-        : { available: false, reason: `${stylist} does not appear on the schedule for ${dateStr}.` };
-    }
-    return vapiRespond(res, toolCallId, {
-      ok: true, date: dateStr, cached, cacheAgeMs,
-      stylistCount: summary.length, schedule: summary,
-      ...(specificCheck ? { specificCheck } : {})
-    });
-  } catch (e) {
-    console.error("SCHEDULE error:", e);
-    return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
-  }
-});
-
-app.post("/availability", async (req, res) => {
-  const toolCallId = extractToolCallId(req);
-  const args = extractArgs(req);
-  const service = args.service || "";
-  const stylist = args.stylist || undefined;
-  const startTime = args.startTime || args.time || "";
-  const startDate = args.startDate || formatYYYYMMDD(new Date(Date.now() + 24 * 60 * 60 * 1000));
-  if (!service) return vapiError(res, toolCallId, "service required");
-  if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g. '5:00 PM')");
-  if (stylist) {
-    try {
-      const { schedule } = await getScheduleCached(startDate);
-      const check = checkStylistAvailability(schedule, stylist, startTime);
-      if (!check.available) {
-        return vapiRespond(res, toolCallId, { ok: true, available: false, reason: check.reason, startDate, scheduleCheck: true });
-      }
-    } catch (e) {
-      console.warn("Schedule check failed (non-fatal), continuing:", e?.message);
-    }
-  }
-  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-  const { context, page } = await getPage(browser);
-  let step = "start";
-  try {
-    if (cookiesExpired()) cookieState = null;
-    step = "login"; await loginIfNeeded(page); await saveCookies(context);
-    step = "openPanel";
-    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(2500);
-    await ensureCreatePanelOpen(page);
-    step = "setDate";
-    const dateSet = await setAppointmentDateIfPossible(page, startDate);
-    const panel = page.locator("sbiz-book-right-panel");
-    step = "setService";
-    await typeaheadSelect(panel.locator('input[formcontrolname="service"]').first(), service);
-    if (stylist) {
-      step = "setStaff";
-      await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
-    }
-    step = "setTime";
-    await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
-    await page.waitForTimeout(1200);
-    step = "detectBlocked";
-    const blockedBanner = page.locator("text=/blocked by/i").first();
-    const isBlocked = await blockedBanner.isVisible().catch(() => false);
-    if (isBlocked) {
-      const bannerText = await blockedBanner.innerText().catch(() => "Blocked by staff");
-      return vapiRespond(res, toolCallId, { ok: true, available: false, reason: bannerText, startDate, dateSet });
-    }
-    return vapiRespond(res, toolCallId, { ok: true, available: true, startDate, dateSet });
-  } catch (e) {
-    console.error("AVAILABILITY error at step:", step, e);
-    await page.screenshot({ path: "/tmp/availability_error.png", fullPage: true }).catch(() => {});
-    return vapiRespond(res, toolCallId, { ok: false, step, error: e?.message || String(e), debug: "/debug/availability_error.png" }, 500);
-  } finally {
-    await context.close().catch(() => {}); await browser.close().catch(() => {});
-  }
-});
+// ── Booking helpers ────────────────────────────────────────────
 
 async function selectExistingClient(page, query) {
   const clientSearch = page.locator("sbiz-book-right-panel").locator('input[placeholder="Search by name or contact"]').first();
@@ -676,28 +549,228 @@ async function clickFinalAppointmentCreate(page) {
   return false;
 }
 
+/**
+ * Check for blocked banner in the booking panel.
+ * Returns { blocked: true, reason } or { blocked: false }
+ */
+async function checkForBlockedBanner(page) {
+  await page.waitForTimeout(1200);
+  const blockedBanner = page.locator("text=/blocked by/i").first();
+  const isBlocked = await blockedBanner.isVisible().catch(() => false);
+  if (isBlocked) {
+    const bannerText = await blockedBanner.innerText().catch(() => "Blocked by staff");
+    return { blocked: true, reason: bannerText };
+  }
+  return { blocked: false };
+}
+
+/**
+ * Core booking function.
+ * Navigates to the correct DATE first (via URL), then opens the panel and fills fields.
+ * REQUIRES startDate - will throw if missing.
+ */
 async function runBooking(page, { isNewClient, customerName, customerPhone, customerEmail, service, stylist, startTime, startDate, customDuration, requestReason }) {
-  await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2500);
-  await ensureCreatePanelOpen(page);
-  await setAppointmentDateIfPossible(page, startDate);
+  if (!startDate) throw new Error("startDate is required in YYYY-MM-DD format");
+
+  // Navigate to the exact date - this is the KEY fix
+  await navigateToBookingDate(page, startDate);
+
   if (isNewClient) {
     await clickClientCreateButton(page);
     await createNewClientInModal(page, { customerName, customerPhone, customerEmail });
   } else {
     await selectExistingClient(page, `${customerName} ${customerPhone}`.trim());
   }
+
   const panel = page.locator("sbiz-book-right-panel");
+
+  // Fill in service
   await typeaheadSelect(panel.locator('input[formcontrolname="service"]').first(), service);
+
+  // Fill in stylist
   if (stylist) await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
+
+  // Fill in time
   await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
+
+  // Fill in duration
   await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
-  if (requestReason) await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason);
+
+  // Fill in notes/reason if provided
+  if (requestReason) {
+    await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason).catch(() => {});
+  }
+
+  // Scroll to make Create button visible
   await panel.evaluate(el => { const sc = el.querySelector(".scrollable"); if (sc) sc.scrollTop = sc.scrollHeight; }).catch(() => {});
+
+  // Check for blocked banner BEFORE clicking Create
+  const preCheck = await checkForBlockedBanner(page);
+  if (preCheck.blocked) {
+    return { clickedFinalCreate: false, blocked: true, reason: preCheck.reason };
+  }
+
   const clicked = await clickFinalAppointmentCreate(page);
-  return { clickedFinalCreate: clicked };
+  if (!clicked) {
+    return { clickedFinalCreate: false, blocked: false };
+  }
+
+  // Post-click: check again for blocked banner
+  const postCheck = await checkForBlockedBanner(page);
+  if (postCheck.blocked) {
+    return { clickedFinalCreate: true, blocked: true, reason: postCheck.reason };
+  }
+
+  return { clickedFinalCreate: true, blocked: false };
 }
 
+// ── HTTP Routes ────────────────────────────────────────────────
+
+app.get("/health", (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
+app.get("/debug/ping", (req, res) => res.json({ ok: true, msg: "pong" }));
+
+app.post("/services", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  if (!PHONE_BOOKABLE_SERVICES.size) return vapiError(res, toolCallId, "PHONE_BOOKABLE_SERVICES env var is empty.");
+  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+  const { context, page } = await getPage(browser);
+  let step = "start";
+  try {
+    if (cookiesExpired()) cookieState = null;
+    step = "login"; await loginIfNeeded(page); await saveCookies(context);
+    step = "openPanel";
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(2500);
+    const serviceInput = await ensureCreatePanelOpen(page);
+    step = "scrapeServices";
+    const allServices = await scrapeTypeaheadUniverse(serviceInput, page);
+    const phoneBookable = allServices.filter(s => PHONE_BOOKABLE_SERVICES.has(s));
+    return vapiRespond(res, toolCallId, { ok: true, countAll: allServices.length, countPhoneBookable: phoneBookable.length, services: phoneBookable });
+  } catch (e) {
+    console.error("SERVICES error at step:", step, e);
+    await page.screenshot({ path: "/tmp/services_error.png", fullPage: true }).catch(() => {});
+    return vapiRespond(res, toolCallId, { ok: false, step, error: e?.message || String(e), debug: "/debug/services_error.png" }, 500);
+  } finally {
+    await context.close().catch(() => {}); await browser.close().catch(() => {});
+  }
+});
+
+app.post("/stylists", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  try {
+    const { stylists, cached, cacheAgeMs } = await getStylistsCached();
+    return vapiRespond(res, toolCallId, { ok: true, cached, cacheAgeMs, count: stylists.length, stylists });
+  } catch (e) {
+    console.error("STYLISTS error:", e);
+    return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e), debug: "/debug/stylists_error.png" }, 500);
+  }
+});
+
+app.post("/schedule", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
+  const dateStr = args.date || args.startDate || todayStr();
+  const stylist = args.stylist || null;
+  const startTime = args.startTime || args.time || null;
+  try {
+    const { schedule, cached, cacheAgeMs } = await getScheduleCached(dateStr);
+    const summary = Object.entries(schedule).map(([name, data]) => ({
+      name,
+      isWorking: data.isWorking,
+      notWorkingPeriods: data.notWorkingPeriods.map(p => ({ from: minutesToTimeStr(p.startMin), to: minutesToTimeStr(p.endMin) }))
+    }));
+    let specificCheck = null;
+    if (stylist && startTime) {
+      specificCheck = checkStylistAvailability(schedule, stylist, startTime);
+    } else if (stylist) {
+      const key = Object.keys(schedule).find(k => k.toLowerCase() === stylist.toLowerCase());
+      specificCheck = key
+        ? { available: schedule[key].isWorking, reason: schedule[key].isWorking ? `${stylist} is working that day.` : `${stylist} is not working that day.` }
+        : { available: false, reason: `${stylist} does not appear on the schedule for ${dateStr}.` };
+    }
+    return vapiRespond(res, toolCallId, {
+      ok: true, date: dateStr, cached, cacheAgeMs,
+      stylistCount: summary.length, schedule: summary,
+      ...(specificCheck ? { specificCheck } : {})
+    });
+  } catch (e) {
+    console.error("SCHEDULE error:", e);
+    return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
+  }
+});
+
+/**
+ * POST /availability
+ * Checks if a stylist is available for a given service, time, and date.
+ * Uses schedule cache (visual schedule read) as primary check.
+ * Falls back to Playwright panel check (blocked banner) as secondary.
+ * startDate is REQUIRED - no default to tomorrow to avoid wrong-date errors.
+ */
+app.post("/availability", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
+  const service = args.service || "";
+  const stylist = args.stylist || undefined;
+  const startTime = args.startTime || args.time || "";
+  const startDate = args.startDate || args.date || "";
+
+  if (!service) return vapiError(res, toolCallId, "service required");
+  if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g. '5:00 PM')");
+  if (!startDate) return vapiError(res, toolCallId, "startDate required (YYYY-MM-DD). The assistant must compute the actual date.");
+
+  // Primary check: schedule (visual read of the calendar)
+  if (stylist) {
+    try {
+      const { schedule } = await getScheduleCached(startDate);
+      const check = checkStylistAvailability(schedule, stylist, startTime);
+      if (!check.available) {
+        return vapiRespond(res, toolCallId, { ok: true, available: false, reason: check.reason, startDate, method: "schedule" });
+      }
+    } catch (e) {
+      console.warn("Schedule check failed (non-fatal), falling back to panel check:", e?.message);
+    }
+  }
+
+  // Secondary check: open the booking panel on the correct date and look for the blocked banner
+  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+  const { context, page } = await getPage(browser);
+  let step = "start";
+  try {
+    if (cookiesExpired()) cookieState = null;
+    step = "login"; await loginIfNeeded(page); await saveCookies(context);
+    // Navigate to the CORRECT date before opening panel
+    step = "navigateToDate";
+    await navigateToBookingDate(page, startDate);
+    const panel = page.locator("sbiz-book-right-panel");
+    step = "setService";
+    await typeaheadSelect(panel.locator('input[formcontrolname="service"]').first(), service);
+    if (stylist) {
+      step = "setStaff";
+      await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
+    }
+    step = "setTime";
+    await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
+    step = "detectBlocked";
+    const bannerCheck = await checkForBlockedBanner(page);
+    if (bannerCheck.blocked) {
+      return vapiRespond(res, toolCallId, { ok: true, available: false, reason: bannerCheck.reason, startDate, method: "panel" });
+    }
+    return vapiRespond(res, toolCallId, { ok: true, available: true, startDate, method: "panel" });
+  } catch (e) {
+    console.error("AVAILABILITY error at step:", step, e);
+    await page.screenshot({ path: "/tmp/availability_error.png", fullPage: true }).catch(() => {});
+    return vapiRespond(res, toolCallId, { ok: false, step, error: e?.message || String(e), debug: "/debug/availability_error.png" }, 500);
+  } finally {
+    await context.close().catch(() => {}); await browser.close().catch(() => {});
+  }
+});
+
+/**
+ * POST /book
+ * Books an appointment.
+ * startDate is REQUIRED. The assistant must compute the exact date (YYYY-MM-DD).
+ * Returns { ok, jobId, status: "running" } immediately; poll /book/status for result.
+ */
 app.post("/book", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -708,10 +781,11 @@ app.post("/book", async (req, res) => {
   const service = args.service || "";
   const stylist = args.stylist || undefined;
   const startTime = args.startTime || args.time || "";
-  const startDate = args.startDate || "";
+  const startDate = args.startDate || args.date || "";
   const customDuration = String(args.customDuration || "60");
   const requestReason = args.requestReason || args.notes || undefined;
 
+  // ── Validation ──────────────────────────────────────────────
   if (!customerName) return vapiError(res, toolCallId, "customerName required");
   if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
   if (isNewClient) {
@@ -725,13 +799,12 @@ app.post("/book", async (req, res) => {
     return vapiError(res, toolCallId, `Service "${service}" is not phone-bookable. Choose a different service.`);
   }
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
-  if (!customDuration) return vapiError(res, toolCallId, "customDuration required (e.g., '60')");
+  if (!startDate) return vapiError(res, toolCallId, "startDate required (YYYY-MM-DD). Please specify the exact date.");
 
-  const effectiveStartDate = startDate || formatYYYYMMDD(new Date(Date.now() + 24 * 60 * 60 * 1000));
-
+  // ── Schedule pre-check ──────────────────────────────────────
   if (stylist) {
     try {
-      const { schedule } = await getScheduleCached(effectiveStartDate);
+      const { schedule } = await getScheduleCached(startDate);
       const check = checkStylistAvailability(schedule, stylist, startTime);
       if (!check.available) {
         return vapiError(res, toolCallId, `${check.reason} Please pick another time or stylist.`);
@@ -741,35 +814,10 @@ app.post("/book", async (req, res) => {
     }
   }
 
-  {
-    const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-    const { context, page } = await getPage(browser);
-    try {
-      if (cookiesExpired()) cookieState = null;
-      await loginIfNeeded(page); await saveCookies(context);
-      await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
-      await page.waitForTimeout(2500);
-      await ensureCreatePanelOpen(page);
-      await setAppointmentDateIfPossible(page, effectiveStartDate);
-      const panel = page.locator("sbiz-book-right-panel");
-      await typeaheadSelect(panel.locator('input[formcontrolname="service"]').first(), service);
-      if (stylist) await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
-      await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
-      await page.waitForTimeout(1200);
-      const blockedBanner = page.locator("text=/blocked by/i").first();
-      const isBlocked = await blockedBanner.isVisible().catch(() => false);
-      if (isBlocked) {
-        const bannerText = await blockedBanner.innerText().catch(() => "Blocked by staff");
-        return vapiError(res, toolCallId, `That time is not available: ${bannerText}. Please pick another time.`);
-      }
-    } finally {
-      await context.close().catch(() => {}); await browser.close().catch(() => {});
-    }
-  }
-
+  // ── Launch booking job ──────────────────────────────────────
   const jobId = newJobId();
   bookingJobs.set(jobId, { status: "running", createdAt: Date.now() });
-  vapiRespond(res, toolCallId, { ok: true, jobId, status: "running" });
+  vapiRespond(res, toolCallId, { ok: true, jobId, status: "running", message: "Booking in progress. Poll /book/status for the result." });
 
   void (async () => {
     const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
@@ -779,32 +827,52 @@ app.post("/book", async (req, res) => {
       if (cookiesExpired()) cookieState = null;
       step = "login"; await loginIfNeeded(page); await saveCookies(context);
       step = "runBooking";
-      const result = await runBooking(page, { isNewClient, customerName, customerPhone, customerEmail, service, stylist, startTime, startDate: effectiveStartDate, customDuration, requestReason });
+      const result = await runBooking(page, { isNewClient, customerName, customerPhone, customerEmail, service, stylist, startTime, startDate, customDuration, requestReason });
+
+      // Screenshot for debugging
       await page.screenshot({ path: "/tmp/appt_after.png", fullPage: true }).catch(() => {});
+
+      if (result.blocked) {
+        await page.screenshot({ path: "/tmp/appt_blocked.png", fullPage: true }).catch(() => {});
+        bookingJobs.set(jobId, {
+          status: "failed",
+          createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
+          error: `Time is blocked: ${result.reason}`,
+          debugScreenshot: "/debug/appt_blocked.png"
+        });
+        return;
+      }
+
       if (!result.clickedFinalCreate) {
         await page.screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true }).catch(() => {});
-        bookingJobs.set(jobId, { status: "failed", createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(), error: 'Could not find/click the FINAL appointment "Create" button.', debugScreenshot: "/debug/appt_create_not_found.png" });
+        bookingJobs.set(jobId, {
+          status: "failed",
+          createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
+          error: 'Could not find/click the FINAL appointment "Create" button.',
+          debugScreenshot: "/debug/appt_create_not_found.png"
+        });
         return;
       }
-      await page.waitForTimeout(1200);
-      const blockedBanner = page.locator("text=/blocked by/i").first();
-      const isBlocked = await blockedBanner.isVisible().catch(() => false);
-      if (isBlocked) {
-        const bannerText = await blockedBanner.innerText().catch(() => "Blocked by staff");
-        await page.screenshot({ path: "/tmp/appt_blocked.png", fullPage: true }).catch(() => {});
-        bookingJobs.set(jobId, { status: "failed", createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(), error: `Blocked: ${bannerText}`, debugScreenshot: "/debug/appt_blocked.png" });
-        return;
-      }
+
       bookingJobs.set(jobId, {
-        status: "succeeded", createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
-        result: { ok: true, message: "Booked successfully", debugScreenshot: "/debug/appt_after.png",
-          normalized: { isNewClient, customerName, customerPhone: digitsOnly(customerPhone), customerEmail, service, stylist, startDate: effectiveStartDate, startTime, customDuration }
+        status: "succeeded",
+        createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
+        result: {
+          ok: true,
+          message: "Booked successfully",
+          debugScreenshot: "/debug/appt_after.png",
+          normalized: { isNewClient, customerName, customerPhone: digitsOnly(customerPhone), customerEmail, service, stylist, startDate, startTime, customDuration }
         }
       });
     } catch (e) {
       console.error("BOOK error at step:", step, e);
       await page.screenshot({ path: "/tmp/book_error.png", fullPage: true }).catch(() => {});
-      bookingJobs.set(jobId, { status: "failed", createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(), error: `${step}: ${e?.message || String(e)}`, debugScreenshot: "/debug/book_error.png" });
+      bookingJobs.set(jobId, {
+        status: "failed",
+        createdAt: bookingJobs.get(jobId)?.createdAt || Date.now(),
+        error: `${step}: ${e?.message || String(e)}`,
+        debugScreenshot: "/debug/book_error.png"
+      });
     } finally {
       await context.close().catch(() => {}); await browser.close().catch(() => {});
     }
@@ -823,6 +891,7 @@ app.post("/book/status", async (req, res) => {
   return vapiRespond(res, toolCallId, { ok: true, jobId, status: "succeeded", result: job.result, debugScreenshot: job.debugScreenshot, message: "Booking succeeded. You may confirm the appointment now." });
 });
 
+// ── Debug screenshot routes ──────────────────────────────────────
 app.get("/debug/appt_after.png", (req, res) => res.sendFile("/tmp/appt_after.png"));
 app.get("/debug/appt_create_not_found.png", (req, res) => res.sendFile("/tmp/appt_create_not_found.png"));
 app.get("/debug/appt_blocked.png", (req, res) => res.sendFile("/tmp/appt_blocked.png"));
