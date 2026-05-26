@@ -534,6 +534,91 @@ function vapiError(res, toolCallId, message, statusCode = 400) {
 
 // ── Booking helpers ────────────────────────────────────────────
 
+async function selectService(page, serviceStr) {
+  const panel = page.locator("sbiz-book-right-panel");
+  const serviceInput = panel.locator('input[formcontrolname="service"]').first();
+
+  // Click the service input — SalonBiz opens an "Add Service" modal
+  await serviceInput.click({ timeout: 15000 });
+  await page.waitForTimeout(1000);
+
+  // Wait for the Add Service modal
+  const modal = page.locator("ngb-modal-window").first();
+  const modalVisible = await modal.waitFor({ state: "visible", timeout: 8000 }).then(() => true).catch(() => false);
+
+  if (!modalVisible) {
+    // Fallback: typeahead style (should not happen in current SalonBiz)
+    await serviceInput.type(serviceStr, { delay: 25 });
+    await page.waitForTimeout(600);
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+    return;
+  }
+
+  // Find the search input inside the modal's "Select Service" panel
+  // It's the input with a magnifying glass icon at the top right of the modal
+  const searchBox = modal.locator('input[type="search"]').first();
+  const searchBoxVisible = await searchBox.isVisible().catch(() => false);
+  const actualSearchBox = searchBoxVisible
+    ? searchBox
+    : modal.locator('input').nth(0); // first input in modal
+
+  await actualSearchBox.waitFor({ state: "visible", timeout: 5000 });
+  await actualSearchBox.click();
+  await actualSearchBox.fill(serviceStr);
+  await page.waitForTimeout(1500); // wait for filter
+
+  // Try to find the best matching row
+  const rows = modal.locator("table tbody tr");
+  const rowCount = await rows.count().catch(() => 0);
+  console.log("[selectService] After search '" + serviceStr + "': " + rowCount + " rows found");
+
+  if (rowCount > 0) {
+    // Try exact match first (row name cell contains service text)
+    const serviceNameLower = serviceStr.toLowerCase();
+    let clicked = false;
+    for (let i = 0; i < Math.min(rowCount, 20); i++) {
+      const nameCell = rows.nth(i).locator("td").first();
+      const cellText = (await nameCell.innerText().catch(() => "")).toLowerCase();
+      if (cellText.includes(serviceNameLower) || serviceNameLower.includes(cellText.replace(/\s+/g," ").trim())) {
+        await rows.nth(i).click({ timeout: 10000 });
+        clicked = true;
+        console.log("[selectService] Clicked row: " + cellText);
+        break;
+      }
+    }
+    if (!clicked) {
+      // Fall back to first row
+      await rows.first().click({ timeout: 10000 });
+      console.log("[selectService] Fell back to first row");
+    }
+  } else {
+    // No results — clear and try first available row
+    await actualSearchBox.fill("");
+    await page.waitForTimeout(800);
+    const allRows = modal.locator("table tbody tr");
+    const total = await allRows.count().catch(() => 0);
+    if (total > 0) {
+      await allRows.first().click({ timeout: 10000 });
+      console.log("[selectService] No search results, clicked first available row");
+    } else {
+      throw new Error("No services found in Add Service modal for: " + serviceStr);
+    }
+  }
+
+  await page.waitForTimeout(500);
+
+  // Click "Select Service" button to confirm
+  const selectBtn = modal.locator('button:has-text("Select Service")').first();
+  await selectBtn.waitFor({ state: "visible", timeout: 5000 });
+  await selectBtn.click({ timeout: 10000 });
+
+  // Wait for modal to close
+  await modal.waitFor({ state: "hidden", timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
+}
+
+
 async function selectExistingClient(page, nameStr, phoneStr) {
   const panel = page.locator("sbiz-book-right-panel");
   const { firstName, lastName } = splitName(nameStr);
@@ -736,7 +821,7 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
   }
 
   const panel = page.locator("sbiz-book-right-panel");
-  await typeaheadSelect(panel.locator('input[formcontrolname="service"]').first(), service);
+  await selectService(page, service);
   if (stylist) await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
   await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
   await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
