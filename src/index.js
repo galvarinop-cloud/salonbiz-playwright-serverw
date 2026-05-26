@@ -148,51 +148,64 @@ async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_USERNAME", SALONBIZ_USERNAME);
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(3000);
 
-  // Handle session-timeout re-login modal (appears when another session is active)
-  const sessionModal = page.locator("ngb-modal-window");
-  const sessionModalVisible = await sessionModal.isVisible().catch(() => false);
-  if (sessionModalVisible) {
-    const passInModal = sessionModal.locator('input[formcontrolname="password"], input[type="password"]').first();
-    if (await passInModal.isVisible().catch(() => false)) {
-      await page.evaluate(({ passVal }) => {
-        const els = document.querySelectorAll('ngb-modal-window input[type="password"], ngb-modal-window input[formcontrolname="password"]');
-        if (!els.length) return;
+  // Helper to fill and submit login form
+  const doLogin = async () => {
+    await page.evaluate(({ un, pw }) => {
+      const setNative = (el, val) => {
         const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-        setter.call(els[0], passVal);
-        els[0].dispatchEvent(new Event("input", { bubbles: true }));
-        els[0].dispatchEvent(new Event("change", { bubbles: true }));
-      }, { passVal: String(SALONBIZ_PASSWORD) });
-      const submitInModal = sessionModal.locator('button[type="submit"], button:has-text("Log in")').first();
-      await submitInModal.click({ timeout: 10000 });
-      await page.waitForTimeout(3000);
+        setter.call(el, val);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      const userEls = document.querySelectorAll('input[formcontrolname="username"], input[placeholder="Username"], input[type="text"]');
+      const passEls = document.querySelectorAll('input[formcontrolname="password"], input[placeholder="Password"], input[type="password"]');
+      if (userEls.length) setNative(userEls[userEls.length - 1], un);
+      if (passEls.length) setNative(passEls[passEls.length - 1], pw);
+    }, { un: String(SALONBIZ_USERNAME), pw: String(SALONBIZ_PASSWORD) });
+    const submitBtn = page.locator('button[type="submit"]:has-text("Log in"), button:has-text("Log in")').first();
+    await submitBtn.click({ timeout: 10000 });
+    await page.waitForTimeout(4000);
+  };
+
+  // Check 1: Are we on the full login page?
+  const onLoginPage = page.url().includes("/login") || (await page.locator('input[formcontrolname="password"]').count() > 0 && await page.locator('input[formcontrolname="username"]').count() > 0);
+  if (onLoginPage) {
+    console.log("[login] On login page, logging in fresh");
+    cookieState = null; // force clear cached cookies
+    await doLogin();
+    return;
+  }
+
+  // Check 2: Session timeout modal (inline re-auth modal)
+  const modal = page.locator("ngb-modal-window");
+  const modalVisible = await modal.isVisible().catch(() => false);
+  if (modalVisible) {
+    const hasPassInput = (await modal.locator('input[type="password"], input[formcontrolname="password"]').count()) > 0;
+    if (hasPassInput) {
+      console.log("[login] Session timeout modal detected, re-logging in");
+      cookieState = null;
+      await doLogin();
       return;
     }
   }
 
-  // Normal login page check
-  const passSel = 'input[formcontrolname="password"]';
-  if ((await page.locator(passSel).count()) === 0) return;
-  const userSel = 'input[formcontrolname="username"]';
-  const submitSel = 'button[type="submit"]';
-  await page.waitForSelector(userSel, { state: "visible", timeout: 15000 });
-  await page.waitForSelector(passSel, { state: "visible", timeout: 15000 });
-  await page.evaluate(({ userSel, passSel, username, password }) => {
-    const user = document.querySelector(userSel);
-    const pass = document.querySelector(passSel);
-    if (!user || !pass) throw new Error("Login inputs not found");
-    const setNative = (el, value) => {
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-      setter.call(el, value);
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    };
-    setNative(user, username);
-    setNative(pass, password);
-  }, { userSel, passSel, username: String(SALONBIZ_USERNAME), password: String(SALONBIZ_PASSWORD) });
-  await page.click(submitSel);
-  await page.waitForTimeout(4000);
+  // Check 3: Re-navigate and check again (handles redirect-to-login)
+  const currentUrl = page.url();
+  if (!currentUrl.includes("appointmentbook")) {
+    console.log("[login] Not on appointmentbook, URL:", currentUrl, "- trying login again");
+    cookieState = null;
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(2000);
+    if (page.url().includes("/login") || (await page.locator('input[formcontrolname="password"]').count() > 0)) {
+      await doLogin();
+    }
+    return;
+  }
+
+  // Already logged in — nothing to do
+  console.log("[login] Already on appointmentbook, session valid");
 }
 async function clickPinkCreateButton(page) {
   const vp = page.viewportSize() || { width: 1280, height: 720 };
@@ -294,6 +307,14 @@ async function stepToDateViaArrows(page, targetDateStr) {
 
 async function navigateToDate(page, dateStr) {
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook?date=${dateStr}`, { waitUntil: "domcontentloaded" });
+  // Re-login if we got redirected to login page
+  if (page.url().includes("/login") || (await page.locator('input[formcontrolname="username"]').count() > 0)) {
+    console.log("[navigateToDate] Redirected to login, re-authenticating");
+    cookieState = null;
+    await loginIfNeeded(page);
+    await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook?date=${dateStr}`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(3000);
+  }
   await page.waitForTimeout(3000);
   if ((await readDisplayedDate(page)) === dateStr) return;
   const pickers = ['input[formcontrolname="date"]', 'input[type="date"]', ".sbiz-datepicker input", "sbiz-date-picker input"];
@@ -950,7 +971,7 @@ app.post("/availability", async (req, res) => {
   const { context, page } = await getPage(browser);
   let step = "start";
   try {
-    if (cookiesExpired()) cookieState = null;
+  cookieState = null; // Always force fresh login for booking
     step = "login"; await loginIfNeeded(page); await saveCookies(context);
     step = "navigateToDate";
     await navigateToBookingDate(page, startDate);
