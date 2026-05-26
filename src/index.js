@@ -513,19 +513,68 @@ function vapiError(res, toolCallId, message, statusCode = 400) {
 // ── Booking helpers ────────────────────────────────────────────
 
 async function selectExistingClient(page, nameStr, phoneStr) {
-const inp = page.locator("sbiz-book-right-panel").locator('input[placeholder="Search by name or contact"]').first();
-await inp.waitFor({ state: "visible", timeout: 15000 });
-const queries = [`${nameStr} ${digitsOnly(phoneStr)}`.trim(), nameStr.trim(), digitsOnly(phoneStr)].filter(Boolean);
-for (const q of queries) {
-  await inp.click(); await inp.fill("");
-  await inp.type(q, { delay: 25 }); await page.waitForTimeout(800);
-  const opts = await readNgbTypeaheadOptions(page);
-  if (opts.length > 0) { await page.keyboard.press("ArrowDown"); await page.keyboard.press("Enter"); await page.waitForTimeout(500); return; }
-}
-await inp.fill(""); await inp.type(nameStr.trim(), { delay: 25 });
-await page.waitForTimeout(800); await page.keyboard.press("ArrowDown"); await page.keyboard.press("Enter");
-}
+  const panel = page.locator("sbiz-book-right-panel");
+  const inp = panel.locator('input[placeholder="Search by name or contact"]').first();
+  await inp.waitFor({ state: "visible", timeout: 15000 });
 
+  // Build search queries: "Firstname Lastname phone", "Firstname Lastname", phone digits
+  const queries = [`${nameStr} ${digitsOnly(phoneStr)}`.trim(), nameStr.trim(), digitsOnly(phoneStr)].filter(Boolean);
+
+  for (const q of queries) {
+    await inp.click(); await inp.fill("");
+    await inp.type(q, { delay: 25 }); 
+    await page.waitForTimeout(1000);
+
+    // Check if a modal opened with search results (SalonBiz's Client Search modal)
+    const modal = page.locator("ngb-modal-window").first();
+    const modalOpen = await modal.isVisible().catch(() => false);
+    if (modalOpen) {
+      // Wait for results to load
+      await page.waitForTimeout(800);
+      // Click the first result row in the modal table
+      const firstRow = modal.locator("table tbody tr").first();
+      const rowVisible = await firstRow.isVisible().catch(() => false);
+      if (rowVisible) {
+        await firstRow.click({ timeout: 10000 });
+        // Wait for modal to close after selection
+        await modal.waitFor({ state: "hidden", timeout: 10000 }).catch(() => {});
+        await page.waitForTimeout(500);
+        return;
+      }
+      // No rows found in modal — close it and try next query
+      await modal.locator('button:has-text("Close"), .btn-close, button[aria-label*="close" i]').first().click({ timeout: 5000 }).catch(() => page.keyboard.press("Escape"));
+      await page.waitForTimeout(500);
+      continue;
+    }
+
+    // Otherwise check for inline typeahead dropdown
+    const opts = await readNgbTypeaheadOptions(page);
+    if (opts.length > 0) { 
+      await page.keyboard.press("ArrowDown"); 
+      await page.keyboard.press("Enter"); 
+      await page.waitForTimeout(500); 
+      return; 
+    }
+  }
+
+  // Last resort: type name and try to pick whatever appears
+  await inp.click(); await inp.fill(""); 
+  await inp.type(nameStr.trim(), { delay: 25 });
+  await page.waitForTimeout(1000);
+  const modal2 = page.locator("ngb-modal-window").first();
+  if (await modal2.isVisible().catch(() => false)) {
+    await page.waitForTimeout(500);
+    const row = modal2.locator("table tbody tr").first();
+    if (await row.isVisible().catch(() => false)) {
+      await row.click({ timeout: 10000 });
+      await modal2.waitFor({ state: "hidden", timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(500);
+    }
+  } else {
+    await page.keyboard.press("ArrowDown"); 
+    await page.keyboard.press("Enter");
+  }
+}
 async function clickClientCreateButton(page) {
   const btn = page.locator("sbiz-book-right-panel").locator("sbiz-search-client").locator('button:has-text("Create")').last();
   await btn.waitFor({ state: "visible", timeout: 15000 });
