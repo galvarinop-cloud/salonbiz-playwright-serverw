@@ -149,6 +149,29 @@ async function loginIfNeeded(page) {
   requiredEnv("SALONBIZ_PASSWORD", SALONBIZ_PASSWORD);
   await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(2000);
+
+  // Handle session-timeout re-login modal (appears when another session is active)
+  const sessionModal = page.locator("ngb-modal-window");
+  const sessionModalVisible = await sessionModal.isVisible().catch(() => false);
+  if (sessionModalVisible) {
+    const passInModal = sessionModal.locator('input[formcontrolname="password"], input[type="password"]').first();
+    if (await passInModal.isVisible().catch(() => false)) {
+      await page.evaluate(({ passVal }) => {
+        const els = document.querySelectorAll('ngb-modal-window input[type="password"], ngb-modal-window input[formcontrolname="password"]');
+        if (!els.length) return;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+        setter.call(els[0], passVal);
+        els[0].dispatchEvent(new Event("input", { bubbles: true }));
+        els[0].dispatchEvent(new Event("change", { bubbles: true }));
+      }, { passVal: String(SALONBIZ_PASSWORD) });
+      const submitInModal = sessionModal.locator('button[type="submit"], button:has-text("Log in")').first();
+      await submitInModal.click({ timeout: 10000 });
+      await page.waitForTimeout(3000);
+      return;
+    }
+  }
+
+  // Normal login page check
   const passSel = 'input[formcontrolname="password"]';
   if ((await page.locator(passSel).count()) === 0) return;
   const userSel = 'input[formcontrolname="username"]';
@@ -171,7 +194,6 @@ async function loginIfNeeded(page) {
   await page.click(submitSel);
   await page.waitForTimeout(4000);
 }
-
 async function clickPinkCreateButton(page) {
   const vp = page.viewportSize() || { width: 1280, height: 720 };
   await page.mouse.click(Math.floor(vp.width * CREATE_CLICK_X_PCT), Math.floor(vp.height * CREATE_CLICK_Y_PCT));
@@ -516,89 +538,111 @@ async function selectExistingClient(page, nameStr, phoneStr) {
   const panel = page.locator("sbiz-book-right-panel");
   const { firstName, lastName } = splitName(nameStr);
 
-  // The inline search input triggers the Client Search modal when typed into
-  const inp = panel.locator('input[placeholder="Search by name or contact"]').first();
-  await inp.waitFor({ state: "visible", timeout: 15000 });
+  // Step 1: Type name in the inline search input
+  const inlineInput = panel.locator('input[placeholder="Search by name or contact"]').first();
+  await inlineInput.waitFor({ state: "visible", timeout: 15000 });
+  await inlineInput.click();
+  await inlineInput.fill("");
+  await inlineInput.type(firstName + (lastName ? " " + lastName : ""), { delay: 25 });
+  await page.waitForTimeout(400);
 
-  // Type the name to trigger the modal
-  await inp.click();
-  await inp.fill("");
-  await inp.type(firstName + " " + lastName, { delay: 30 });
+  // Step 2: Click the Search button next to the inline input (this opens the modal)
+  const inlineSearchBtn = panel.locator('sbiz-search-client button:has-text("Search")').first();
+  await inlineSearchBtn.click({ timeout: 10000 });
   await page.waitForTimeout(800);
 
-  // Wait for the Client Search modal to appear (SalonBiz opens this instead of a dropdown)
+  // Step 3: Wait for the Client Search modal
   const modal = page.locator("ngb-modal-window").first();
-  const modalAppeared = await modal.waitFor({ state: "visible", timeout: 5000 }).then(() => true).catch(() => false);
+  await modal.waitFor({ state: "visible", timeout: 10000 });
+  await page.waitForTimeout(500);
 
-  if (modalAppeared) {
-    // The modal may have pre-filled the name and shown results already.
-    // Clear and re-fill the First Name and Last Name fields in the modal for accuracy.
-    await page.waitForTimeout(500);
-    
-    const firstInp = modal.locator('input[placeholder="First Name"]').first();
-    const lastInp = modal.locator('input[placeholder="Last Name"]').first();
-    const contactInp = modal.locator('input[placeholder="Contact"]').first();
+  // Step 4: Fill modal search fields (use formcontrolname selectors)
+  // Clear and fill firstName
+  const fnInput = modal.locator('input[formcontrolname="firstName"]').first();
+  if (await fnInput.isVisible().catch(() => false)) {
+    await fnInput.click({ clickCount: 3 });
+    await fnInput.fill(firstName);
+  }
+  // Clear and fill lastName
+  const lnInput = modal.locator('input[formcontrolname="lastName"]').first();
+  if (await lnInput.isVisible().catch(() => false)) {
+    await lnInput.click({ clickCount: 3 });
+    await lnInput.fill(lastName);
+  }
+  // Fill contact (phone) if we have it
+  const contactInput = modal.locator('input[formcontrolname="contact"]').first();
+  if (phoneStr && await contactInput.isVisible().catch(() => false)) {
+    await contactInput.click({ clickCount: 3 });
+    await contactInput.fill(digitsOnly(phoneStr));
+  }
 
-    if (await firstInp.isVisible().catch(() => false)) {
-      await firstInp.click({ clickCount: 3 });
-      await firstInp.fill(firstName);
-    }
-    if (await lastInp.isVisible().catch(() => false)) {
-      await lastInp.click({ clickCount: 3 });
-      await lastInp.fill(lastName);
-    }
-    if (phoneStr && await contactInp.isVisible().catch(() => false)) {
-      await contactInp.click({ clickCount: 3 });
-      await contactInp.fill(digitsOnly(phoneStr));
-    }
+  // Step 5: Click the Search button INSIDE the modal
+  const modalSearchBtn = modal.locator('button:has-text("Search")').first();
+  await modalSearchBtn.click({ timeout: 10000 });
+  await page.waitForTimeout(2500); // wait for results to load
 
-    // Click the Search button inside the modal
-    const searchBtn = modal.locator('button:has-text("Search")').first();
-    await searchBtn.click({ timeout: 10000 });
-    await page.waitForTimeout(2000); // wait for results to load
-
-    // Click the first result row
-    const firstRow = modal.locator("table tbody tr").first();
-    if (await firstRow.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await firstRow.click({ timeout: 10000 });
-      await modal.waitFor({ state: "hidden", timeout: 15000 }).catch(() => {});
-      await page.waitForTimeout(500);
-      return;
-    }
-
-    // No results with full name — try phone only
+  // Step 6: Click the correct row in results
+  // Try to find a row matching the phone number first, then fall back to first row
+  let rowClicked = false;
+  const rows = modal.locator("table tbody tr");
+  const rowCount = await rows.count().catch(() => 0);
+  
+  if (rowCount > 0) {
+    // Try to match by phone number
     if (phoneStr && digitsOnly(phoneStr)) {
-      if (await firstInp.isVisible().catch(() => false)) await firstInp.fill("");
-      if (await lastInp.isVisible().catch(() => false)) await lastInp.fill("");
-      if (await contactInp.isVisible().catch(() => false)) {
-        await contactInp.click({ clickCount: 3 });
-        await contactInp.fill(digitsOnly(phoneStr));
-      }
-      await searchBtn.click({ timeout: 10000 });
-      await page.waitForTimeout(2000);
-      const row2 = modal.locator("table tbody tr").first();
-      if (await row2.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await row2.click({ timeout: 10000 });
-        await modal.waitFor({ state: "hidden", timeout: 15000 }).catch(() => {});
-        await page.waitForTimeout(500);
-        return;
+      const phoneDigits = digitsOnly(phoneStr);
+      for (let i = 0; i < rowCount; i++) {
+        const rowText = await rows.nth(i).innerText().catch(() => "");
+        if (digitsOnly(rowText).includes(phoneDigits.slice(-7))) {
+          await rows.nth(i).click({ timeout: 10000 });
+          rowClicked = true;
+          break;
+        }
       }
     }
+    // Fall back to first row
+    if (!rowClicked) {
+      await rows.first().click({ timeout: 10000 });
+      rowClicked = true;
+    }
+  }
 
-    // Close modal — client not found, will be treated as new
+  if (!rowClicked) {
+    // No results with full name — try phone-only search
+    if (phoneStr && digitsOnly(phoneStr)) {
+      const fnInp2 = modal.locator('input[formcontrolname="firstName"]').first();
+      const lnInp2 = modal.locator('input[formcontrolname="lastName"]').first();
+      const ctInp2 = modal.locator('input[formcontrolname="contact"]').first();
+      if (await fnInp2.isVisible().catch(() => false)) { await fnInp2.click({ clickCount: 3 }); await fnInp2.fill(""); }
+      if (await lnInp2.isVisible().catch(() => false)) { await lnInp2.click({ clickCount: 3 }); await lnInp2.fill(""); }
+      if (await ctInp2.isVisible().catch(() => false)) { await ctInp2.click({ clickCount: 3 }); await ctInp2.fill(digitsOnly(phoneStr)); }
+      await modalSearchBtn.click({ timeout: 10000 });
+      await page.waitForTimeout(2500);
+      const rows2 = modal.locator("table tbody tr");
+      const count2 = await rows2.count().catch(() => 0);
+      if (count2 > 0) {
+        await rows2.first().click({ timeout: 10000 });
+        rowClicked = true;
+      }
+    }
+  }
+
+  if (!rowClicked) {
+    // Close modal and throw — client not found, caller will create new
     const closeBtn = modal.locator('button:has-text("Close")').first();
     await closeBtn.click({ timeout: 5000 }).catch(() => page.keyboard.press("Escape"));
     await page.waitForTimeout(500);
-    throw new Error(`Client not found: "${nameStr}" (phone: ${phoneStr}). Verify the details.`);
+    throw new Error(`Client not found: "${nameStr}" (phone: ${phoneStr}). Will create as new client.`);
   }
 
-  // Fallback: no modal — try ArrowDown+Enter on inline dropdown
-  const opts = await readNgbTypeaheadOptions(page);
-  if (opts.length > 0) {
-    await page.keyboard.press("ArrowDown");
-    await page.keyboard.press("Enter");
-    await page.waitForTimeout(500);
-  }
+  // Step 7: Click the Select button to confirm the selection
+  const selectBtn = modal.locator('button:has-text("Select")').first();
+  await selectBtn.waitFor({ state: "visible", timeout: 5000 });
+  await selectBtn.click({ timeout: 10000 });
+
+  // Step 8: Wait for the modal to close
+  await modal.waitFor({ state: "hidden", timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
 }
 async function clickClientCreateButton(page) {
   const btn = page.locator("sbiz-book-right-panel").locator("sbiz-search-client").locator('button:has-text("Create")').last();
@@ -618,19 +662,24 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
   await setTextInput(modal.locator('input[formcontrolname="firstName"]').first(), firstName);
   await setTextInput(modal.locator('input[formcontrolname="lastName"]').first(), lastName);
   await setTextInput(modal.locator('input[formcontrolname="telMobile"]').first(), formatUsPhoneMaybe(customerPhone));
-  await setTextInput(modal.locator('input[formcontrolname="email"]').first(), customerEmail);
-  await modal.locator('button[type="submit"]:has-text("Create")').first().click({ timeout: 15000 });
+  // Email is optional for walk-in clients
+  const emailInp = modal.locator('input[formcontrolname="email"]').first();
+  if (customerEmail && isValidEmail(customerEmail) && await emailInp.isVisible().catch(() => false)) {
+    await setTextInput(emailInp, customerEmail);
+  }
+  const createBtn = modal.locator('button[type="submit"]:has-text("Create"), button.sbiz-btn--primary:has-text("Create")').first();
+  await createBtn.waitFor({ state: "visible", timeout: 10000 });
+  await createBtn.click({ timeout: 15000 });
   await page.waitForTimeout(1500);
   const stillVisible = await modal.isVisible().catch(() => false);
   if (stillVisible) {
-    const alertText = await modal.locator(".sbiz-alert").innerText().catch(() => "");
+    const alertText = await modal.locator(".sbiz-alert, .alert, [class*='error']").innerText().catch(() => "");
     await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
     throw new Error(`New client modal did not close. SalonBiz error: ${alertText || "(no alert text found)"}`);
   }
   await modal.waitFor({ state: "hidden", timeout: 20000 });
   await page.waitForTimeout(800);
 }
-
 async function clickFinalAppointmentCreate(page) {
   const panel = page.locator("sbiz-book-right-panel");
   const candidates = [
@@ -673,7 +722,17 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
     await clickClientCreateButton(page);
     await createNewClientInModal(page, { customerName, customerPhone, customerEmail });
   } else {
-    await selectExistingClient(page, customerName, customerPhone);
+    // Try to find existing client; if not found, fall back to creating them
+    try {
+      await selectExistingClient(page, customerName, customerPhone);
+    } catch (e) {
+      console.log("Existing client not found, creating new:", e.message);
+      // Client not in system — create them as new
+      // Need to navigate back and open create panel fresh
+      await navigateToBookingDate(page, startDate);
+      await clickClientCreateButton(page);
+      await createNewClientInModal(page, { customerName, customerPhone, customerEmail: customerEmail || "noemail@amare.com" });
+    }
   }
 
   const panel = page.locator("sbiz-book-right-panel");
@@ -703,7 +762,6 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
 
   return { clickedFinalCreate: true, blocked: false };
 }
-
 // ── HTTP Routes ────────────────────────────────────────────────
 
 app.get("/health", (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
