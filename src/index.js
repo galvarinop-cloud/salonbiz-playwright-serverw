@@ -102,6 +102,35 @@ function minutesToTimeStr(m) {
   return `${h12}:${String(min).padStart(2,"0")} ${ampm}`;
 }
 
+// Normalize loose voice time strings → "5:00 PM"
+const WORD_TO_HOUR = {one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10,eleven:11,twelve:12};
+function normalizeStartTime(raw) {
+  if (!raw) return raw;
+  let s = String(raw).trim().toLowerCase();
+  for (const [w,n] of Object.entries(WORD_TO_HOUR)) s = s.replace(new RegExp('\\b'+w+'\\b','g'),String(n));
+  if (/^\d{1,2}:\d{2}\s*(am|pm)$/i.test(s)) return s.replace(/^(\d{1,2}:\d{2})\s*(am|pm)$/i,(_,t,p)=>t+' '+p.toUpperCase());
+  const m1=s.match(/^(\d{1,2})\s*(am|pm)$/i); if(m1) return `${m1[1]}:00 ${m1[2].toUpperCase()}`;
+  const m2=s.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/i); if(m2) return `${m2[1]}:${m2[2]} ${m2[3].toUpperCase()}`;
+  const m3=s.match(/^(\d{1,2})(?::(\d{2}))?$/);
+  if(m3){let h=parseInt(m3[1],10);const mn=m3[2]||'00';const ap=h<12?'AM':'PM';if(h===0)h=12;else if(h>12)h-=12;return `${h}:${mn} ${ap}`;}
+  return raw;
+}
+
+// Resolve startDate: use arg if valid YYYY-MM-DD, else infer from current ET time
+function resolveStartDate(startDateArg, startTimeStr) {
+  if (startDateArg && /^\d{4}-\d{2}-\d{2}$/.test(String(startDateArg).trim())) return String(startDateArg).trim();
+  const etNow = new Date(new Date().toLocaleString('en-US',{timeZone:'America/New_York'}));
+  const todayFmt = formatYYYYMMDD(etNow);
+  if (startTimeStr) {
+    const reqMin = parseTimeToMinutes(startTimeStr);
+    const curMin = etNow.getHours()*60+etNow.getMinutes();
+    if (reqMin!==null && reqMin<=curMin) {
+      const tom=new Date(etNow); tom.setDate(tom.getDate()+1); return formatYYYYMMDD(tom);
+    }
+  }
+  return todayFmt;
+}
+
 async function getPage(browser) {
   const context = await browser.newContext(cookieState ? { storageState: cookieState } : undefined);
   const page = await context.newPage();
@@ -483,10 +512,18 @@ function vapiError(res, toolCallId, message, statusCode = 400) {
 
 // ── Booking helpers ────────────────────────────────────────────
 
-async function selectExistingClient(page, query) {
-  const clientSearch = page.locator("sbiz-book-right-panel").locator('input[placeholder="Search by name or contact"]').first();
-  await clientSearch.waitFor({ state: "visible", timeout: 15000 });
-  await typeaheadSelect(clientSearch, query);
+async function selectExistingClient(page, nameStr, phoneStr) {
+const inp = page.locator("sbiz-book-right-panel").locator('input[placeholder="Search by name or contact"]').first();
+await inp.waitFor({ state: "visible", timeout: 15000 });
+const queries = [`${nameStr} ${digitsOnly(phoneStr)}`.trim(), nameStr.trim(), digitsOnly(phoneStr)].filter(Boolean);
+for (const q of queries) {
+  await inp.click(); await inp.fill("");
+  await inp.type(q, { delay: 25 }); await page.waitForTimeout(800);
+  const opts = await readNgbTypeaheadOptions(page);
+  if (opts.length > 0) { await page.keyboard.press("ArrowDown"); await page.keyboard.press("Enter"); await page.waitForTimeout(500); return; }
+}
+await inp.fill(""); await inp.type(nameStr.trim(), { delay: 25 });
+await page.waitForTimeout(800); await page.keyboard.press("ArrowDown"); await page.keyboard.press("Enter");
 }
 
 async function clickClientCreateButton(page) {
@@ -562,7 +599,7 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
     await clickClientCreateButton(page);
     await createNewClientInModal(page, { customerName, customerPhone, customerEmail });
   } else {
-    await selectExistingClient(page, `${customerName} ${customerPhone}`.trim());
+    await selectExistingClient(page, customerName, customerPhone);
   }
 
   const panel = page.locator("sbiz-book-right-panel");
@@ -742,8 +779,8 @@ app.post("/book", async (req, res) => {
   const customerEmail = normalizeEmail(args.customerEmail || args.email || "");
   const service = args.service || "";
   const stylist = args.stylist || undefined;
-  const startTime = args.startTime || args.time || "";
-  const startDate = args.startDate || args.date || "";
+  const startTime = normalizeStartTime(args.startTime || args.time || "");
+const startDate = resolveStartDate(args.startDate || args.date || "", startTime);
   const customDuration = String(args.customDuration || "60");
   const requestReason = args.requestReason || args.notes || undefined;
 
@@ -761,7 +798,7 @@ app.post("/book", async (req, res) => {
     return vapiError(res, toolCallId, `Service "${service}" is not phone-bookable. Choose a different service.`);
   }
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
-  if (!startDate) return vapiError(res, toolCallId, "startDate required (YYYY-MM-DD). Please specify the exact date.");
+  if (!startDate) return vapiError(res, toolCallId, "startDate is missing. Please provide the appointment date in YYYY-MM-DD format.");
 
   // ── Schedule pre-check ──────────────────────────────────────
   if (stylist) {
@@ -826,7 +863,7 @@ app.post("/book", async (req, res) => {
     return vapiRespond(res, toolCallId, {
       ok: true,
       booked: true,
-      message: "Appointment booked successfully.",
+      message: `Appointment confirmed: ${service} on ${startDate} at ${startTime}${stylist ? ' with ' + stylist : ''} for ${customerName}.`,
       details: {
         customerName,
         customerPhone: digitsOnly(customerPhone),
