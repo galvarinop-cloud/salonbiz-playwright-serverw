@@ -20,7 +20,7 @@ let cookieStateSetAt = 0;
 const COOKIE_TTL_MS = Number(process.env.COOKIE_TTL_MS || 1000 * 60 * 60 * 6);
 
 const PHONE_BOOKABLE_SERVICES_RAW = process.env.PHONE_BOOKABLE_SERVICES || "";
-const PHONE_BOOKABLE_SERVICES = new Set(
+const PHONE_BOOKABLE_SERVICES = new Set(h
   PHONE_BOOKABLE_SERVICES_RAW.split(/\r?\n|,/).map((s) => s.trim()).filter(Boolean)
 );
 
@@ -837,7 +837,7 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
       // Need to navigate back and open create panel fresh
       await navigateToBookingDate(page, startDate);
       await clickClientCreateButton(page);
-      await createNewClientInModal(page, { customerName, customerPhone, customerEmail: customerEmail || "noemail@amare.com" });
+      await createNewClientInModal(page, { customerName, customerPhone, customerEmail: "" });
     }
   }
 
@@ -947,7 +947,7 @@ app.post("/availability", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
   const service = args.service || "";
-  const stylist = args.stylist || undefined;
+  let stylist = args.stylist || undefined;
   const startTime = args.startTime || args.time || "";
   const startDate = args.startDate || args.date || "";
 
@@ -1016,7 +1016,7 @@ app.post("/book", async (req, res) => {
   const customerPhone = args.customerPhone || args.phone || "";
   const customerEmail = normalizeEmail(args.customerEmail || args.email || "");
   const service = args.service || "";
-  const stylist = args.stylist || undefined;
+  let stylist = args.stylist || undefined;
   const startTime = normalizeStartTime(args.startTime || args.time || "");
 const startDate = resolveStartDate(args.startDate || args.date || "", startTime);
   const customDuration = String(args.customDuration || "60");
@@ -1028,8 +1028,8 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
   if (isNewClient) {
     const { firstName, lastName } = splitName(customerName);
     if (!firstName || !lastName) return vapiError(res, toolCallId, "For new clients, please provide first AND last name.");
-    if (!customerEmail) return vapiError(res, toolCallId, "Email required for new clients.");
-    if (!isValidEmail(customerEmail)) return vapiError(res, toolCallId, `That email looks invalid: "${customerEmail}". Please repeat it.`);
+    if (!customerEmail) return vapiError(res, toolCallId, "// Email is optional for phone bookings");
+    if (!isValidEmail(customerEmail)) return vapiError(res, toolCallId, `// Email validation removed - not required: "${customerEmail}". Please repeat it.`);
   }
   if (!service) return vapiError(res, toolCallId, "service required");
   if (PHONE_BOOKABLE_SERVICES.size && !PHONE_BOOKABLE_SERVICES.has(service)) {
