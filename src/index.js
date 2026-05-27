@@ -1050,6 +1050,25 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
       console.warn("Schedule pre-check failed (non-fatal):", e?.message);
     }
   }
+    // Auto-select available stylist when none provided
+    if (!stylist) {
+          try {
+                  const { schedule } = await getScheduleCached(startDate);
+                  const reqMin = parseTimeToMinutes(startTime);
+                  const avail = Object.entries(schedule).filter(([n, d]) => {
+                            if (!d.isWorking) return false;
+                            if (reqMin === null) return true;
+                            return !d.notWorkingPeriods.some(p => reqMin >= p.startMin && reqMin < p.endMin);
+                  });
+                  if (avail.length > 0) {
+                            const pick = avail[Math.floor(Math.random() * avail.length)];
+                            stylist = pick[0];
+                            console.log('[book] Auto-selected stylist:', stylist);
+                  }
+          } catch (e) {
+                  console.warn('Auto-stylist failed:', e?.message);
+          }
+    }
 
   // ── Run booking synchronously ───────────────────────────────
   // We set a timeout so we don't hang forever
