@@ -750,8 +750,7 @@ async function selectExistingClient(page, nameStr, phoneStr) {
   await modal.waitFor({ state: "hidden", timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(800);
 }
-async function clickClientCreateButton(page) {
-  const btn = page.locator("sbiz-book-right-panel").locator("sbiz-search-client").locator('button:has-text("Create")').last();
+let stillVisible = await modal.isVisible  const btn = page.locator("sbiz-book-right-panel").locator("sbiz-search-client").locator('button:has-text("Create")').last();
   await btn.waitFor({ state: "visible", timeout: 15000 });
   await btn.click({ timeout: 15000 });
   await page.waitForTimeout(1200);
@@ -777,7 +776,18 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
   await createBtn.waitFor({ state: "visible", timeout: 10000 });
   await createBtn.click({ timeout: 15000 });
   await page.waitForTimeout(1500);
-  const stillVisible = await modal.isVisible().catch(() => false);
+  let stillVisible = await modal.isVisible().catch(() => false);
+    if (stillVisible) {
+          // Retry: clear email if it caused a conflict
+          const emailInpRetry = modal.locator('input[formcontrolname="email"]').first();
+          if (await emailInpRetry.isVisible().catch(() => false)) {
+                  await emailInpRetry.click({ clickCount: 3 });
+                  await emailInpRetry.fill("");
+                  await createBtn.click({ timeout: 15000 });
+                  await page.waitForTimeout(1500);
+                  stillVisible = await modal.isVisible().catch(() => false);
+          }
+    }
   if (stillVisible) {
     const alertText = await modal.locator(".sbiz-alert, .alert, [class*='error']").innerText().catch(() => "");
     await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
