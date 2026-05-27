@@ -1028,8 +1028,8 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
   if (isNewClient) {
     const { firstName, lastName } = splitName(customerName);
     if (!firstName || !lastName) return vapiError(res, toolCallId, "For new clients, please provide first AND last name.");
-    if (!customerEmail) return vapiError(res, toolCallId, "// Email is optional for phone bookings");
-    if (!isValidEmail(customerEmail)) return vapiError(res, toolCallId, `// Email validation removed - not required: "${customerEmail}". Please repeat it.`);
+    // Email not required for phone bookings
+    // Email validation not required
   }
   if (!service) return vapiError(res, toolCallId, "service required");
   if (PHONE_BOOKABLE_SERVICES.size && !PHONE_BOOKABLE_SERVICES.has(service)) {
