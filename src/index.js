@@ -787,31 +787,29 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
     throw new Error("New client requires first AND last name.");
   }
 
-  // Fill an Angular reactive form field via the browser, triggering all Angular events
+  // Fill an Angular reactive form field using both evaluate (for angular events) and page.type
   const fillAngularField = async (locator, value) => {
     await locator.waitFor({ state: "visible", timeout: 8000 });
     await locator.scrollIntoViewIfNeeded().catch(() => {});
-    // Use evaluate to set value with Angular's native setter + proper events
+    // First use evaluate to set via native input setter (triggers angular)
     await locator.evaluate((el, val) => {
-      // Clear existing value
       const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
       nativeInputValueSetter.call(el, '');
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
-      // Set new value
       nativeInputValueSetter.call(el, val);
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
       el.dispatchEvent(new Event('blur', { bubbles: true }));
     }, String(value));
     await page.waitForTimeout(100);
-    // Also type it character-by-character to ensure Angular picks it up
+    // Then also type it (belt + suspenders approach)
     await locator.click({ clickCount: 3 });
     await page.keyboard.press('Control+a');
     await page.keyboard.press('Delete');
     await locator.type(String(value), { delay: 20 });
     await locator.press('Tab');
-    await page.waitForTimeout(150);
+    await page.waitForTimeout(200);
   };
 
   // Scroll modal to top
@@ -835,7 +833,7 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
   const phoneFormatted = formatUsPhoneMaybe(customerPhone);
   await fillAngularField(telInput, phoneFormatted);
 
-  // Fill email if provided (some forms require it)
+  // Fill email if provided
   if (customerEmail && isValidEmail(customerEmail)) {
     const emailInput = modal.locator('input[formcontrolname="email"]').first();
     const emailVisible = await emailInput.isVisible().catch(() => false);
@@ -847,7 +845,7 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
   // Take screenshot to verify fields are filled before clicking Create
   await page.screenshot({ path: "/tmp/new_client_before_create.png", fullPage: true }).catch(() => {});
 
-  // Try to find and click the Create/Submit button
+  // Find Create button
   const submitSelectors = [
     'button[type="submit"]:has-text("Create")',
     'button.sbiz-btn--primary:has-text("Create")',
@@ -871,27 +869,39 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
   await page.waitForTimeout(3000);
 
   let stillVisible = await modal.isVisible().catch(() => false);
+
   if (stillVisible) {
-    // Take error screenshot and check error text
     await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
-    const errorText = await modal.locator(".sbiz-alert, .alert, .invalid-feedback, [class*='error'], .text-danger").first().innerText().catch(() => "");
-    console.log("[createNewClientInModal] Modal still open after Create click. Error text:", errorText);
 
-    // Try strategy 2: Use Enter key
-    await page.keyboard.press("Enter");
-    await page.waitForTimeout(2000);
-    stillVisible = await modal.isVisible().catch(() => false);
-  }
+    // Check for error messages - especially duplicate client errors
+    const errorText = await modal.locator(".sbiz-alert, .alert, .invalid-feedback, [class*='error'], .text-danger, .sbiz-error, .alert-danger").allInnerTexts().catch(() => []);
+    const allErrors = errorText.join(' ').toLowerCase();
+    console.log("[createNewClientInModal] Error text:", allErrors || "(none visible)");
 
-  if (stillVisible) {
-    // Strategy 3: Re-fill fields and try again - sometimes fields lose value
-    console.log("[createNewClientInModal] Retrying field fill...");
+    // Check if it's a duplicate/existing client error
+    if (allErrors.includes('already') || allErrors.includes('exist') || allErrors.includes('duplicate') || allErrors.includes('found')) {
+      // Close modal and throw a special error so caller knows to select existing instead
+      const closeBtn = modal.locator('button:has-text("Close"), button[aria-label="Close"]').first();
+      await closeBtn.click({ timeout: 5000 }).catch(() => page.keyboard.press("Escape"));
+      await page.waitForTimeout(500);
+      throw new Error("DUPLICATE_CLIENT: Client already exists in SalonBiz. Select existing client instead.");
+    }
+
+    // Strategy 2: Re-fill fields and try again
+    console.log("[createNewClientInModal] Retrying field fill + submit...");
     await fillAngularField(fnInput, firstName);
     await fillAngularField(lnInput, lastName);
     await fillAngularField(telInput, phoneFormatted);
     await page.waitForTimeout(500);
     await createBtn.click({ timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(3000);
+    stillVisible = await modal.isVisible().catch(() => false);
+  }
+
+  if (stillVisible) {
+    // Final strategy: try pressing Enter
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(2000);
     stillVisible = await modal.isVisible().catch(() => false);
   }
 
@@ -945,18 +955,47 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
     await clickClientCreateButton(page);
     await createNewClientInModal(page, { customerName, customerPhone, customerEmail });
   } else {
-    // Try to find existing client; if not found, fall back to creating them
+    // Strategy 1: Find existing client by name + phone
+    let clientFound = false;
     try {
       await selectExistingClient(page, customerName, customerPhone);
+      clientFound = true;
+      console.log("[runBooking] Found existing client:", customerName);
     } catch (e) {
-      console.log("Existing client not found, creating new:", e.message);
-      // Save a screenshot to see why client search failed
+      console.log("[runBooking] selectExistingClient failed:", e.message);
       await page.screenshot({ path: "/tmp/client_search_failed.png", fullPage: true }).catch(() => {});
-      // Client not in system — create them as new
-      // Need to navigate back and open create panel fresh
+    }
+
+    if (!clientFound) {
+      // Strategy 2: Re-navigate and try selectExistingClient again (fresh state)
+      console.log("[runBooking] Retrying client search...");
+      await navigateToBookingDate(page, startDate);
+      try {
+        await selectExistingClient(page, customerName, customerPhone);
+        clientFound = true;
+        console.log("[runBooking] Found existing client on retry:", customerName);
+      } catch (e2) {
+        console.log("[runBooking] Retry also failed:", e2.message);
+      }
+    }
+
+    if (!clientFound) {
+      // Strategy 3: Create as new client (they may be genuinely new, or search may have failed)
+      console.log("[runBooking] Creating client as new:", customerName);
       await navigateToBookingDate(page, startDate);
       await clickClientCreateButton(page);
-      await createNewClientInModal(page, { customerName, customerPhone, customerEmail: "" });
+      try {
+        await createNewClientInModal(page, { customerName, customerPhone, customerEmail: customerEmail || "" });
+      } catch (createErr) {
+        // Check if it's a duplicate client error - if so, try selecting existing
+        if (String(createErr.message).includes('DUPLICATE_CLIENT')) {
+          console.log("[runBooking] Duplicate client detected, trying to select existing...");
+          await navigateToBookingDate(page, startDate);
+          await selectExistingClient(page, customerName, customerPhone);
+        } else {
+          throw createErr;
+        }
+      }
     }
   }
 
