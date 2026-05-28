@@ -549,7 +549,7 @@ async function fetchStylistsFromSalonBiz() {
 
 async function getStylistsCached() {
   const now = Date.now();
-  if (stylistCache.value && now - stylistCache.fetchedAt < STYLIST_CACHE_TTL_MS) {
+  if (stylistCache.value && stylistCache.value.length > 0 && now - stylistCache.fetchedAt < STYLIST_CACHE_TTL_MS) {
     return { stylists: stylistCache.value, cached: true, cacheAgeMs: now - stylistCache.fetchedAt };
   }
   const stylists = await fetchStylistsFromSalonBiz();
@@ -781,36 +781,93 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
     await page.screenshot({ path: "/tmp/new_client_missing_lastname.png", fullPage: true }).catch(() => {});
     throw new Error("New client requires first AND last name.");
   }
-  await setTextInput(modal.locator('input[formcontrolname="firstName"]').first(), firstName);
-  await setTextInput(modal.locator('input[formcontrolname="lastName"]').first(), lastName);
-  await setTextInput(modal.locator('input[formcontrolname="telMobile"]').first(), formatUsPhoneMaybe(customerPhone));
-  // Email is optional for walk-in clients
-  const emailInp = modal.locator('input[formcontrolname="email"]').first();
-  if (customerEmail && isValidEmail(customerEmail) && await emailInp.isVisible().catch(() => false)) {
-    await setTextInput(emailInp, customerEmail);
-  }
+
+  // Use Angular-compatible native value setter to properly trigger form validation
+  await page.evaluate(({ fn, ln, ph }) => {
+    function setNativeVal(el, val) {
+      if (!el) return;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+      if (setter) setter.call(el, val);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    const modalEl = document.querySelector("ngb-modal-window");
+    if (!modalEl) return;
+    const fnEl = modalEl.querySelector('input[formcontrolname="firstName"]');
+    const lnEl = modalEl.querySelector('input[formcontrolname="lastName"]');
+    const telEl = modalEl.querySelector('input[formcontrolname="telMobile"]');
+    setNativeVal(fnEl, fn);
+    setNativeVal(lnEl, ln);
+    if (ph && telEl) setNativeVal(telEl, ph);
+  }, { fn: firstName, ln: lastName, ph: formatUsPhoneMaybe(customerPhone) });
+
+  await page.waitForTimeout(800);
+
+  // Scroll modal to top and click each field to mark as touched (Angular validation)
+  await modal.evaluate(el => { const sc = el.querySelector('.modal-body, .sbiz-modal__body'); if (sc) sc.scrollTop = 0; }).catch(() => {});
+  await page.waitForTimeout(300);
+  const fnField = modal.locator('input[formcontrolname="firstName"]').first();
+  const lnField = modal.locator('input[formcontrolname="lastName"]').first();
+  const telField = modal.locator('input[formcontrolname="telMobile"]').first();
+  if (await fnField.isVisible().catch(() => false)) { await fnField.click(); await page.keyboard.press("Tab"); }
+  if (await lnField.isVisible().catch(() => false)) { await lnField.click(); await page.keyboard.press("Tab"); }
+  if (await telField.isVisible().catch(() => false)) { await telField.click(); await page.keyboard.press("Tab"); }
+  await page.waitForTimeout(400);
+
+  // Click Create button
   const createBtn = modal.locator('button[type="submit"]:has-text("Create"), button.sbiz-btn--primary:has-text("Create")').first();
   await createBtn.waitFor({ state: "visible", timeout: 10000 });
+
+  // Check if Create button is enabled
+  const isDisabled = await createBtn.isDisabled().catch(() => false);
+  if (isDisabled) {
+    // Try clicking the modal body first to trigger validation, then re-check
+    await modal.click({ position: { x: 10, y: 10 } }).catch(() => {});
+    await page.waitForTimeout(500);
+    // Re-run evaluate to ensure values are set
+    await page.evaluate(({ fn, ln, ph }) => {
+      function setNativeVal(el, val) {
+        if (!el) return;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+        if (setter) setter.call(el, val);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
+      }
+      const modalEl = document.querySelector("ngb-modal-window");
+      if (!modalEl) return;
+      const fnEl = modalEl.querySelector('input[formcontrolname="firstName"]');
+      const lnEl = modalEl.querySelector('input[formcontrolname="lastName"]');
+      const telEl = modalEl.querySelector('input[formcontrolname="telMobile"]');
+      setNativeVal(fnEl, fn);
+      setNativeVal(lnEl, ln);
+      if (ph && telEl) setNativeVal(telEl, ph);
+    }, { fn: firstName, ln: lastName, ph: formatUsPhoneMaybe(customerPhone) });
+    await page.waitForTimeout(500);
+  }
+
   await createBtn.click({ timeout: 15000 });
   await page.waitForTimeout(3000);
+
   let stillVisible = await modal.isVisible().catch(() => false);
-    if (stillVisible) {
-          // Retry: clear email if it caused a conflict
-          const emailInpRetry = modal.locator('input[formcontrolname="email"]').first();
-          if (await emailInpRetry.isVisible().catch(() => false)) {
-                  await emailInpRetry.click({ clickCount: 3 });
-                  await emailInpRetry.fill("");
-                  await createBtn.click({ timeout: 15000 });
-                                      await page.waitForTimeout(3000);
-                  stillVisible = await modal.isVisible().catch(() => false);
-          }
-    }
   if (stillVisible) {
-    const alertText = await modal.locator(".sbiz-alert, .alert, [class*='error']").innerText().catch(() => "");
-    await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
-    throw new Error(`New client modal did not close. SalonBiz error: ${alertText || "(no alert text found)"}`);
+    // Check for error alerts
+    const alertText = await modal.locator(".sbiz-alert, .alert, [class*='error'], .invalid-feedback").first().innerText().catch(() => "");
+    if (alertText) {
+      await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
+      throw new Error("New client form error: " + alertText);
+    }
+    // Try one more click
+    await createBtn.click({ timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(3000);
+    stillVisible = await modal.isVisible().catch(() => false);
   }
-  await modal.waitFor({ state: "hidden", timeout: 20000 });
+
+  if (stillVisible) {
+    await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
+    throw new Error("New client modal did not close after create. Form may have validation errors.");
+  }
+  await modal.waitFor({ state: "hidden", timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(800);
 }
 async function clickFinalAppointmentCreate(page) {
