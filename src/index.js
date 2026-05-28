@@ -17,7 +17,7 @@ const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
 
 let cookieState = null;
 let cookieStateSetAt = 0;
-const COOKIE_TTL_MS = Number(process.env.COOKIE_TTL_MS || 1000 * 60 * 60 * 6);
+const COOKIE_TTL_MS = Number(process.env.COOKIE_TTL_MS || 1000 * 60 * 60 * 6);h
 
 const PHONE_BOOKABLE_SERVICES_RAW = process.env.PHONE_BOOKABLE_SERVICES || "";
 const PHONE_BOOKABLE_SERVICES = new Set(
@@ -211,6 +211,24 @@ async function clickPinkCreateButton(page) {
   const vp = page.viewportSize() || { width: 1280, height: 720 };
   await page.mouse.click(Math.floor(vp.width * CREATE_CLICK_X_PCT), Math.floor(vp.height * CREATE_CLICK_Y_PCT));
   await page.waitForTimeout(1200);
+}
+
+async function clickClientCreateButton(page) {
+  // Click the "Create" button in the client search panel to open the new client form
+  const panel = page.locator("sbiz-book-right-panel");
+  const btn = panel.locator('sbiz-search-client button:has-text("Create")').last();
+  const btnVisible = await btn.isVisible().catch(() => false);
+  if (btnVisible) {
+    await btn.click({ timeout: 10000 });
+    await page.waitForTimeout(1200);
+    return;
+  }
+  // Fallback: try any Create button in the panel
+  const anyBtn = panel.locator('button:has-text("Create")').first();
+  if (await anyBtn.isVisible().catch(() => false)) {
+    await anyBtn.click({ timeout: 10000 });
+    await page.waitForTimeout(1200);
+  }
 }
 
 async function ensureCreatePanelOpen(page) {
@@ -464,7 +482,11 @@ async function scrapeScheduleForDate(page, dateStr) {
 
 function checkStylistAvailability(scheduleMap, stylistFirstName, startTimeStr) {
   if (!scheduleMap || !stylistFirstName) return { available: true, reason: "no schedule data" };
-  const key = Object.keys(scheduleMap).find(k => k.toLowerCase() === stylistFirstName.toLowerCase());
+  // Fuzzy name matching: exact match first, then starts-with, then includes
+  const nameLower = stylistFirstName.toLowerCase().replace(/[^a-z]/g, '');
+  const key = Object.keys(scheduleMap).find(k => k.toLowerCase().replace(/[^a-z]/g,'') === nameLower)
+    || Object.keys(scheduleMap).find(k => k.toLowerCase().replace(/[^a-z]/g,'').startsWith(nameLower.slice(0,4)))
+    || Object.keys(scheduleMap).find(k => nameLower.startsWith(k.toLowerCase().replace(/[^a-z]/g,'').slice(0,4)));
   if (!key) return { available: false, reason: `${stylistFirstName} does not appear on the schedule for that day.` };
   const entry = scheduleMap[key];
   if (!entry.isWorking) return { available: false, reason: `${stylistFirstName} is not working that day.` };
@@ -1049,7 +1071,8 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
       const { schedule } = await getScheduleCached(startDate);
       const check = checkStylistAvailability(schedule, stylist, startTime);
       if (!check.available) {
-        return vapiError(res, toolCallId, `${check.reason} Please pick another time or stylist.`);
+        // Schedule pre-check is informational only - let Playwright determine actual availability
+      console.warn("[book] Schedule pre-check says unavailable:", check.reason, "- attempting booking anyway");
       }
     } catch (e) {
       console.warn("Schedule pre-check failed (non-fatal):", e?.message);
