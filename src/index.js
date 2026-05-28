@@ -750,12 +750,6 @@ async function selectExistingClient(page, nameStr, phoneStr) {
   await modal.waitFor({ state: "hidden", timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(800);
 }
-let stillVisible = await modal.isVisible();
-    const btn = page.locator("sbiz-book-right-panel").locator("sbiz-search-client").locator('button:has-text("Create")').last();
-  await btn.waitFor({ state: "visible", timeout: 15000 });
-  await btn.click({ timeout: 15000 });
-  await page.waitForTimeout(1200);
-}
 
 async function createNewClientInModal(page, { customerName, customerPhone, customerEmail }) {
   const modal = page.locator("ngb-modal-window").first();
@@ -776,7 +770,7 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
   const createBtn = modal.locator('button[type="submit"]:has-text("Create"), button.sbiz-btn--primary:has-text("Create")').first();
   await createBtn.waitFor({ state: "visible", timeout: 10000 });
   await createBtn.click({ timeout: 15000 });
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(3000);
   let stillVisible = await modal.isVisible().catch(() => false);
     if (stillVisible) {
           // Retry: clear email if it caused a conflict
@@ -785,7 +779,7 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
                   await emailInpRetry.click({ clickCount: 3 });
                   await emailInpRetry.fill("");
                   await createBtn.click({ timeout: 15000 });
-                  await page.waitForTimeout(1500);
+                                      await page.waitForTimeout(3000);
                   stillVisible = await modal.isVisible().catch(() => false);
           }
     }
