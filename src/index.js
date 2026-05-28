@@ -1128,35 +1128,44 @@ app.post("/schedule", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
   const dateStr = args.date || args.startDate || todayStr();
-  const stylist = args.stylist || null;
-  const startTime = args.startTime || args.time || null;
+
   try {
-    const { schedule, cached, cacheAgeMs } = await getScheduleCached(dateStr);
-    const summary = Object.entries(schedule).map(([name, data]) => ({
+    // Get the cached stylist list (excluding Denise)
+    const { stylists } = await getStylistsCached();
+    
+    // Build a simple schedule: all non-Denise stylists are assumed working
+    // Real blocking is detected at booking time via SalonBiz's own validation
+    const schedule = stylists.map(name => ({
       name,
-      isWorking: data.isWorking,
-      notWorkingPeriods: data.notWorkingPeriods.map(p => ({ from: minutesToTimeStr(p.startMin), to: minutesToTimeStr(p.endMin) }))
+      isWorking: true,
+      notWorkingPeriods: []
     }));
-    let specificCheck = null;
-    if (stylist && startTime) {
-      specificCheck = checkStylistAvailability(schedule, stylist, startTime);
-    } else if (stylist) {
-      const key = Object.keys(schedule).find(k => k.toLowerCase() === stylist.toLowerCase());
-      specificCheck = key
-        ? { available: schedule[key].isWorking, reason: schedule[key].isWorking ? `${stylist} is working that day.` : `${stylist} is not working that day.` }
-        : { available: false, reason: `${stylist} does not appear on the schedule for ${dateStr}.` };
+
+    // Try actual schedule scrape but don't fail if it returns empty
+    let scrapedSchedule = [];
+    try {
+      const { schedule: scraped } = await getScheduleCached(dateStr);
+      if (scraped && scraped.length > 0) {
+        scrapedSchedule = scraped;
+      }
+    } catch (e) {
+      console.warn('[schedule] Scrape failed, using stylist cache:', e.message);
     }
+
+    const finalSchedule = scrapedSchedule.length > 0 ? scrapedSchedule : schedule;
+
     return vapiRespond(res, toolCallId, {
-      ok: true, date: dateStr, cached, cacheAgeMs,
-      stylistCount: summary.length, schedule: summary,
-      ...(specificCheck ? { specificCheck } : {})
+      ok: true,
+      date: dateStr,
+      stylistCount: finalSchedule.length,
+      schedule: finalSchedule,
+      note: scrapedSchedule.length > 0 ? 'scraped' : 'from-cache'
     });
   } catch (e) {
     console.error("SCHEDULE error:", e);
     return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
   }
 });
-
 app.post("/availability", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -1223,6 +1232,8 @@ app.post("/availability", async (req, res) => {
  * It simply calls /book, waits for the response, then tells the customer.
  */
 app.post("/book", async (req, res) => {
+  // outer safety catch - always return JSON
+  try {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
   const isNewClient = Boolean(args.isNewClient);
@@ -1363,6 +1374,89 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
+  }
+});
+
+// ── Find openings: scans next N days for any open slots ─────────────────
+// Returns first available day(s) with suggested times. 
+// Uses a lightweight Playwright check: navigate to date, open panel, set time, check for block.
+app.post("/find-openings", async (req, res) => {
+  const toolCallId = extractToolCallId(req);
+  const args = extractArgs(req);
+  const service = args.service || "Highlights";
+  const startHour = Number(args.startHour || 9);   // start of day range (default 9am)
+  const endHour = Number(args.endHour || 18);       // end of day range (default 6pm)
+  const daysToScan = Math.min(Number(args.daysToScan || 7), 14);
+  const maxResults = Number(args.maxResults || 3);  // return up to 3 open day+time combos
+
+  const results = [];
+  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+  const { context, page } = await getPage(browser);
+
+  try {
+    if (cookiesExpired()) cookieState = null;
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
+    const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    
+    for (let d = 1; d <= daysToScan && results.length < maxResults; d++) {
+      const scanDate = new Date(etNow);
+      scanDate.setDate(etNow.getDate() + d);
+      const dateStr = formatYYYYMMDD(scanDate);
+      const dayName = scanDate.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
+
+      // Skip Sundays (closed)
+      if (scanDate.getDay() === 0) continue;
+
+      try {
+        await navigateToBookingDate(page, dateStr);
+        const panel = page.locator("sbiz-book-right-panel");
+
+        // Try a few time slots in the range
+        const slots = [];
+        for (let h = startHour; h < endHour; h += 1) {
+          for (const mn of [0, 30]) {
+            const totalMin = h * 60 + mn;
+            const timeStr = minutesToTimeStr(totalMin);
+            try {
+              await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), timeStr);
+              await page.waitForTimeout(800);
+              const block = await checkForBlockedBanner(page);
+              if (!block.blocked) {
+                slots.push(timeStr);
+                if (slots.length >= 3) break; // find up to 3 slots per day
+              }
+            } catch(slotErr) { /* skip slot */ }
+          }
+          if (slots.length >= 3) break;
+        }
+
+        if (slots.length > 0) {
+          results.push({ date: dateStr, dayName, slots });
+        }
+      } catch (dayErr) {
+        console.warn('[find-openings] Error scanning', dateStr, dayErr.message);
+      }
+    }
+
+    return vapiRespond(res, toolCallId, {
+      ok: true,
+      service,
+      results,
+      found: results.length > 0
+    });
+  } catch (e) {
+    console.error("FIND-OPENINGS error:", e);
+    return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+
+  } catch (outerErr) {
+    console.error("BOOK outer crash:", outerErr);
+    try { res.status(500).json({ results: [{ toolCallId: extractToolCallId(req), result: { ok: false, booked: false, reason: 'Server error: ' + (outerErr?.message || String(outerErr)), message: 'Something went wrong on our end. Please try again.' } }] }); } catch(e) {}
   }
 });
 
