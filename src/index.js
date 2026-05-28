@@ -103,17 +103,41 @@ function minutesToTimeStr(m) {
 }
 
 // Normalize loose voice time strings → "5:00 PM"
+// Handles: "2:30 PM", "two thirty PM", "3 PM", "three", "14:30", digit-word combos
 const WORD_TO_HOUR = {one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10,eleven:11,twelve:12};
+const WORD_TO_MIN = {oh:0,zero:0,ten:10,fifteen:15,twenty:20,thirty:30,forty:40,fifty:50};
 function normalizeStartTime(raw) {
-  if (!raw) return raw;
-  let s = String(raw).trim().toLowerCase();
-  for (const [w,n] of Object.entries(WORD_TO_HOUR)) s = s.replace(new RegExp('\\b'+w+'\\b','g'),String(n));
-  if (/^\d{1,2}:\d{2}\s*(am|pm)$/i.test(s)) return s.replace(/^(\d{1,2}:\d{2})\s*(am|pm)$/i,(_,t,p)=>t+' '+p.toUpperCase());
-  const m1=s.match(/^(\d{1,2})\s*(am|pm)$/i); if(m1) return `${m1[1]}:00 ${m1[2].toUpperCase()}`;
-  const m2=s.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/i); if(m2) return `${m2[1]}:${m2[2]} ${m2[3].toUpperCase()}`;
-  const m3=s.match(/^(\d{1,2})(?::(\d{2}))?$/);
-  if(m3){let h=parseInt(m3[1],10);const mn=m3[2]||'00';const ap=h<12?'AM':'PM';if(h===0)h=12;else if(h>12)h-=12;return `${h}:${mn} ${ap}`;}
-  return raw;
+if (!raw) return raw;
+let s = String(raw).trim().toLowerCase().replace(/[,]/g,'');
+// Replace hour words with digits first
+for (const [w,n] of Object.entries(WORD_TO_HOUR)) s = s.replace(new RegExp('\\b'+w+'\\b','gi'),String(n));
+// Handle "X thirty PM", "X forty-five AM" — word-based minutes
+const wordMinPatterns = [
+  [/twenty[- ]?five/gi,'25'],[/twenty[- ]?one/gi,'21'],[/thirty[- ]?five/gi,'35'],
+  [/forty[- ]?five/gi,'45'],[/fifty[- ]?five/gi,'55'],[/twenty/gi,'20'],[/thirty/gi,'30'],
+  [/forty/gi,'40'],[/fifty/gi,'50'],[/fifteen/gi,'15'],[/\boh\b/gi,'0'],[/\bzero\b/gi,'0']
+];
+for (const [rx,rep] of wordMinPatterns) s = s.replace(rx, rep);
+// Now s should have digits only. Try to parse.
+// Pattern: "2 30 pm" or "2 30pm"
+let m = s.match(/^(\d{1,2})\s+(\d{1,2})\s*(am|pm)$/i);
+if (m) return `${m[1]}:${m[2].padStart(2,'0')} ${m[3].toUpperCase()}`;
+// Pattern: "2:30 PM"
+m = s.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/i);
+if (m) return `${m[1]}:${m[2]} ${m[3].toUpperCase()}`;
+// Pattern: "14:30" (24h)
+m = s.match(/^(\d{2}):(\d{2})$/);
+if (m) { let h=parseInt(m[1]); const mn=m[2]; const ap=h>=12?'PM':'AM'; if(h>12)h-=12; if(h===0)h=12; return `${h}:${mn} ${ap}`; }
+// Pattern: "2:30" no ampm
+m = s.match(/^(\d{1,2}):(\d{2})$/);
+if (m) { const h=parseInt(m[1]); return `${h}:${m[2]} ${h<12?'AM':'PM'}`; }
+// Pattern: "2 PM" or "2pm"
+m = s.match(/^(\d{1,2})\s*(am|pm)$/i);
+if (m) return `${m[1]}:00 ${m[2].toUpperCase()}`;
+// Pattern: just a number (hour only, assume PM if 1-7, AM if 8-12)
+m = s.match(/^(\d{1,2})$/);
+if (m) { const h=parseInt(m[1]); return `${h}:00 ${(h>=8&&h<=11)?'AM':'PM'}`; }
+return raw;
 }
 
 // Resolve startDate: use arg if valid YYYY-MM-DD, else infer from current ET time
@@ -534,7 +558,7 @@ async function fetchStylistsFromSalonBiz() {
     const staffInput = page.locator("sbiz-book-right-panel").locator('input[formcontrolname="staff"]').first();
     await staffInput.waitFor({ state: "visible", timeout: 20000 });
     const stylistsRaw = await scrapeTypeaheadUniverse(staffInput, page);
-    const filtered = stylistsRaw.filter(n => n && !n.toLowerCase().includes("head spa"));
+    const filtered = stylistsRaw.filter(n => n && !n.toLowerCase().includes("head spa") && !n.toLowerCase().startsWith("denise"));
     const cleaned = filtered.map(n => n.trim().split(/\s+/)[0]).filter(Boolean);
     return Array.from(new Set(cleaned));
   } catch (e) {
@@ -1026,6 +1050,38 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
 
   return { clickedFinalCreate: true, blocked: false };
 }
+// ── Schedule-aware time suggestion helper ─────────────────────
+// Returns available time slots for a stylist on a date within a given range
+async function getSuggestedTime(dateStr, startHour, endHour, stylistFirstName) {
+  try {
+    const { schedule } = await getScheduleCached(dateStr);
+    const candidates = [];
+    // Generate 30-min slots within the range
+    for (let h = startHour; h < endHour; h++) {
+      for (const mn of [0, 30]) {
+        const totalMin = h * 60 + mn;
+        const timeStr = minutesToTimeStr(totalMin);
+        // Check if stylist is available at this time (or any stylist if none specified)
+        if (stylistFirstName) {
+          const check = checkStylistAvailability(schedule, stylistFirstName, timeStr);
+          if (check.available) candidates.push({ time: timeStr, stylist: stylistFirstName });
+        } else {
+          // Find any available stylist at this time
+          for (const [name, data] of Object.entries(schedule)) {
+            if (name.toLowerCase().startsWith('denise')) continue; // exclude Denise
+            const check = checkStylistAvailability(schedule, name, timeStr);
+            if (check.available) { candidates.push({ time: timeStr, stylist: name }); break; }
+          }
+        }
+      }
+    }
+    return candidates;
+  } catch (e) {
+    console.warn('[getSuggestedTime] Failed:', e.message);
+    return [];
+  }
+}
+
 // ── HTTP Routes ────────────────────────────────────────────────
 
 app.get("/health", (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
