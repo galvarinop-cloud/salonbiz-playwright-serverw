@@ -750,7 +750,8 @@ async function selectExistingClient(page, nameStr, phoneStr) {
   await modal.waitFor({ state: "hidden", timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(800);
 }
-let stillVisible = await modal.isVisible  const btn = page.locator("sbiz-book-right-panel").locator("sbiz-search-client").locator('button:has-text("Create")').last();
+let stillVisible = await modal.isVisible();
+    const btn = page.locator("sbiz-book-right-panel").locator("sbiz-search-client").locator('button:has-text("Create")').last();
   await btn.waitFor({ state: "visible", timeout: 15000 });
   await btn.click({ timeout: 15000 });
   await page.waitForTimeout(1200);
