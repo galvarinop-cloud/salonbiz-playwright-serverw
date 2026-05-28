@@ -11,7 +11,6 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const SALONBIZ_BASE_URL = process.env.SALONBIZ_BASE_URL || "https://central-app.salonbiz.com";
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
-const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 const CREATE_CLICK_X_PCT = Number(process.env.CREATE_CLICK_X_PCT || 0.95);
 const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
 
@@ -1232,8 +1231,6 @@ app.post("/availability", async (req, res) => {
  * It simply calls /book, waits for the response, then tells the customer.
  */
 app.post("/book", async (req, res) => {
-  // outer safety catch - always return JSON
-  try {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
   const isNewClient = Boolean(args.isNewClient);
@@ -1454,10 +1451,6 @@ app.post("/find-openings", async (req, res) => {
     await browser.close().catch(() => {});
   }
 
-  } catch (outerErr) {
-    console.error("BOOK outer crash:", outerErr);
-    try { res.status(500).json({ results: [{ toolCallId: extractToolCallId(req), result: { ok: false, booked: false, reason: 'Server error: ' + (outerErr?.message || String(outerErr)), message: 'Something went wrong on our end. Please try again.' } }] }); } catch(e) {}
-  }
 });
 
 // ── Legacy /book/status route (kept for compatibility) ─────────
