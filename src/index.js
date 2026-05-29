@@ -593,10 +593,12 @@ function extractArgs(req) {
   return {};
 }
 function vapiRespond(res, toolCallId, result, statusCode = 200) {
-  return res.status(statusCode).json({ results: [{ toolCallId, result }] });
+  // Always use 200 so Vapi can read the result (non-2xx causes "No result returned")
+  return res.status(200).json({ results: [{ toolCallId, result }] });
 }
-function vapiError(res, toolCallId, message, statusCode = 400) {
-  return vapiRespond(res, toolCallId, { ok: false, error: message }, statusCode);
+function vapiError(res, toolCallId, message, statusCode = 200) {
+  // Always return 200 so Vapi can read the error message and tell the user
+  return vapiRespond(res, toolCallId, { ok: false, error: message }, 200);
 }
 
 // ── Booking helpers ────────────────────────────────────────────
