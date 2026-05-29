@@ -1335,8 +1335,8 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
 });
 
 // ── Find openings: reads SalonBiz calendar to find real open slots ──────────
-// Scrapes actual appointments for each day and finds gaps >= minGapMinutes.
-// Returns days with real available time slots.
+// Scrapes actual appointments using .dhx_cal_event containers with hidden time text.
+// Finds gaps >= minGapMinutes and returns real available time slots.
 app.post("/find-openings", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -1345,8 +1345,17 @@ app.post("/find-openings", async (req, res) => {
   const endHour = Number(args.endHour || 18);
   const daysToScan = Math.min(Number(args.daysToScan || 7), 14);
   const maxResults = Number(args.maxResults || 3);
-  const minGapMinutes = Number(args.minGapMinutes || 60); // must have at least this many free minutes
+  const minGapMinutes = Number(args.minGapMinutes || 60);
   const slotIntervalMinutes = 30;
+
+  // DHtmlX scheduler pixel constants (SalonBiz uses DHtmlX)
+  // Calendar starts at 7:00 AM = top:0, scale is 0.852px per minute
+  const CALENDAR_START_HOUR = 7;
+  const PX_PER_MIN = 25.555 / 30; // ~0.852
+
+  function dhxPixelToMinutes(px) {
+    return Math.round(CALENDAR_START_HOUR * 60 + px / PX_PER_MIN);
+  }
 
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
   const { context, page } = await getPage(browser);
@@ -1363,104 +1372,63 @@ app.post("/find-openings", async (req, res) => {
       const scanDate = new Date(etNow);
       scanDate.setDate(etNow.getDate() + d);
       const dayOfWeek = scanDate.getDay();
-
-      // Skip Sunday (0) - salon is closed
-      if (dayOfWeek === 0) continue;
+      if (dayOfWeek === 0) continue; // Skip Sunday
 
       const dateStr = formatYYYYMMDD(scanDate);
       const dayName = scanDate.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
 
-      // Navigate to this date on the appointment book
       try {
         await navigateToDate(page, dateStr);
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(2500);
       } catch (e) {
-        console.warn('[find-openings] navigateToDate failed for', dateStr, e.message);
+        console.warn('[find-openings] navigateToDate failed for', dateStr, ':', e.message);
         continue;
       }
 
-      // Scrape all appointment blocks from the calendar
-      // Each appointment block has a start time and duration visible in the calendar
-      const appointments = [];
-      try {
-        // Get all appointment elements - they are colored blocks on the calendar
-        const apptBlocks = await page.locator('sbiz-appointment-block, [class*="appointment-block"], [class*="appt-block"], .sbiz-appt').all().catch(() => []);
-        
-        // Also try to get them via the time column for pixel-based calculation
-        const timeMap = await buildTimeMap(page);
-        
-        if (timeMap.length >= 2) {
-          // Use pixel-based approach: find blocks that aren't "not working" blocks
-          const allBlocks = await page.locator('sbiz-appointment-block').all().catch(() => []);
-          
-          for (const block of allBlocks) {
-            const text = await block.innerText().catch(() => '');
-            if (/not working/i.test(text)) continue;
-            const bb = await block.boundingBox().catch(() => null);
-            if (!bb || bb.height < 5) continue;
-            const startMin = pixelToMinutes(bb.y, timeMap);
-            const endMin = pixelToMinutes(bb.y + bb.height, timeMap);
-            if (startMin !== null && endMin !== null && endMin > startMin) {
-              appointments.push({ startMin, endMin, text: text.trim().substring(0, 50) });
-            }
-          }
-          
-          // Fallback: try generic colored div blocks that represent appointments
-          if (appointments.length === 0) {
-            const coloredBlocks = await page.locator('.sbiz-appointment, [class*="appointment"]:not([class*="book"]):not([class*="panel"])').all().catch(() => []);
-            for (const block of coloredBlocks) {
-              const text = await block.innerText().catch(() => '');
-              if (/not working/i.test(text)) continue;
-              const bb = await block.boundingBox().catch(() => null);
-              if (!bb || bb.height < 5) continue;
-              const startMin = pixelToMinutes(bb.y, timeMap);
-              const endMin = pixelToMinutes(bb.y + bb.height, timeMap);
-              if (startMin !== null && endMin !== null && endMin > startMin && endMin - startMin <= 240) {
-                appointments.push({ startMin, endMin });
-              }
-            }
-          }
+      // Scrape appointments using DHtmlX event blocks
+      // Each .dhx_cal_event that contains .scheduler-appointment-block__container is a real appointment
+      const appointments = await page.evaluate((args) => {
+        const { calStartHour, pxPerMin } = args;
+        const events = document.querySelectorAll('.dhx_cal_event');
+        const appts = [];
+        for (const ev of events) {
+          const block = ev.querySelector('.scheduler-appointment-block__container');
+          if (!block) continue; // Not an appointment (might be blocked time)
+          const style = ev.getAttribute('style') || '';
+          const topMatch = style.match(/top:(\d+(?:\.\d+)?)px/);
+          const heightMatch = style.match(/height:(\d+(?:\.\d+)?)px/);
+          if (!topMatch || !heightMatch) continue;
+          const topPx = parseFloat(topMatch[1]);
+          const heightPx = parseFloat(heightMatch[1]);
+          // Convert pixels to minutes from midnight
+          const startMin = Math.round(calStartHour * 60 + topPx / pxPerMin);
+          const durationMin = Math.round(heightPx / pxPerMin);
+          const endMin = startMin + Math.max(durationMin, 15); // at least 15 min
+          appts.push({ startMin, endMin });
         }
-        
-        console.log('[find-openings]', dateStr, '- found', appointments.length, 'appointments');
-      } catch (e) {
-        console.warn('[find-openings] appointment scrape error for', dateStr, ':', e.message);
-      }
+        return appts;
+      }, { calStartHour: CALENDAR_START_HOUR, pxPerMin: PX_PER_MIN });
 
-      // Sort appointments by start time
+      console.log('[find-openings]', dateStr, '- scraped', appointments.length, 'appointments');
       appointments.sort((a, b) => a.startMin - b.startMin);
 
-      // Find gaps >= minGapMinutes between appointments (and before first / after last)
+      // Find free slots with at least minGapMinutes of free time
       const businessStartMin = startHour * 60;
       const businessEndMin = endHour * 60;
 
-      // Build "busy" intervals from appointments
-      const busyIntervals = appointments.filter(a => 
-        a.startMin < businessEndMin && a.endMin > businessStartMin
-      );
-
-      // Find free slots: 30-min slots that have minGapMinutes of free time after them
       const freeSlots = [];
       for (let slotMin = businessStartMin; slotMin + minGapMinutes <= businessEndMin; slotMin += slotIntervalMinutes) {
         const slotEnd = slotMin + minGapMinutes;
-        // Check if this slot overlaps with any busy interval
-        const isBusy = busyIntervals.some(interval => 
-          slotMin < interval.endMin && slotEnd > interval.startMin
-        );
+        const isBusy = appointments.some(a => slotMin < a.endMin && slotEnd > a.startMin);
         if (!isBusy) {
           freeSlots.push(minutesToTimeStr(slotMin));
         }
       }
 
-      console.log('[find-openings]', dateStr, '- free slots:', freeSlots.join(', '));
+      console.log('[find-openings]', dateStr, '- free slots:', freeSlots.slice(0, 4).join(', '));
 
       if (freeSlots.length > 0) {
-        results.push({ 
-          date: dateStr, 
-          dayName, 
-          slots: freeSlots.slice(0, 4), // max 4 slots per day
-          appointmentCount: appointments.length
-        });
+        results.push({ date: dateStr, dayName, slots: freeSlots.slice(0, 4), appointmentCount: appointments.length });
       }
     }
 
