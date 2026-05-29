@@ -1334,9 +1334,9 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
   }
 });
 
-// ── Find openings: scans next N days for any open slots ─────────────────
-// Returns first available day(s) with suggested times. 
-// Uses a lightweight Playwright check: navigate to date, open panel, set time, check for block.
+// ── Find openings: reads SalonBiz calendar to find real open slots ──────────
+// Scrapes actual appointments for each day and finds gaps >= minGapMinutes.
+// Returns days with real available time slots.
 app.post("/find-openings", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -1345,8 +1345,17 @@ app.post("/find-openings", async (req, res) => {
   const endHour = Number(args.endHour || 18);
   const daysToScan = Math.min(Number(args.daysToScan || 7), 14);
   const maxResults = Number(args.maxResults || 3);
+  const minGapMinutes = Number(args.minGapMinutes || 60); // must have at least this many free minutes
+  const slotIntervalMinutes = 30;
+
+  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+  const { context, page } = await getPage(browser);
 
   try {
+    if (cookiesExpired()) cookieState = null;
+    await loginIfNeeded(page);
+    await saveCookies(context);
+
     const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
     const results = [];
 
@@ -1361,29 +1370,114 @@ app.post("/find-openings", async (req, res) => {
       const dateStr = formatYYYYMMDD(scanDate);
       const dayName = scanDate.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
 
-      // Generate slots in the range
-      const slots = [];
-      for (let h = startHour; h < endHour && slots.length < 3; h++) {
-        for (const mn of [0, 30]) {
-          if (slots.length >= 3) break;
-          const totalMin = h * 60 + mn;
-          slots.push(minutesToTimeStr(totalMin));
+      // Navigate to this date on the appointment book
+      try {
+        await navigateToDate(page, dateStr);
+        await page.waitForTimeout(2000);
+      } catch (e) {
+        console.warn('[find-openings] navigateToDate failed for', dateStr, e.message);
+        continue;
+      }
+
+      // Scrape all appointment blocks from the calendar
+      // Each appointment block has a start time and duration visible in the calendar
+      const appointments = [];
+      try {
+        // Get all appointment elements - they are colored blocks on the calendar
+        const apptBlocks = await page.locator('sbiz-appointment-block, [class*="appointment-block"], [class*="appt-block"], .sbiz-appt').all().catch(() => []);
+        
+        // Also try to get them via the time column for pixel-based calculation
+        const timeMap = await buildTimeMap(page);
+        
+        if (timeMap.length >= 2) {
+          // Use pixel-based approach: find blocks that aren't "not working" blocks
+          const allBlocks = await page.locator('sbiz-appointment-block').all().catch(() => []);
+          
+          for (const block of allBlocks) {
+            const text = await block.innerText().catch(() => '');
+            if (/not working/i.test(text)) continue;
+            const bb = await block.boundingBox().catch(() => null);
+            if (!bb || bb.height < 5) continue;
+            const startMin = pixelToMinutes(bb.y, timeMap);
+            const endMin = pixelToMinutes(bb.y + bb.height, timeMap);
+            if (startMin !== null && endMin !== null && endMin > startMin) {
+              appointments.push({ startMin, endMin, text: text.trim().substring(0, 50) });
+            }
+          }
+          
+          // Fallback: try generic colored div blocks that represent appointments
+          if (appointments.length === 0) {
+            const coloredBlocks = await page.locator('.sbiz-appointment, [class*="appointment"]:not([class*="book"]):not([class*="panel"])').all().catch(() => []);
+            for (const block of coloredBlocks) {
+              const text = await block.innerText().catch(() => '');
+              if (/not working/i.test(text)) continue;
+              const bb = await block.boundingBox().catch(() => null);
+              if (!bb || bb.height < 5) continue;
+              const startMin = pixelToMinutes(bb.y, timeMap);
+              const endMin = pixelToMinutes(bb.y + bb.height, timeMap);
+              if (startMin !== null && endMin !== null && endMin > startMin && endMin - startMin <= 240) {
+                appointments.push({ startMin, endMin });
+              }
+            }
+          }
+        }
+        
+        console.log('[find-openings]', dateStr, '- found', appointments.length, 'appointments');
+      } catch (e) {
+        console.warn('[find-openings] appointment scrape error for', dateStr, ':', e.message);
+      }
+
+      // Sort appointments by start time
+      appointments.sort((a, b) => a.startMin - b.startMin);
+
+      // Find gaps >= minGapMinutes between appointments (and before first / after last)
+      const businessStartMin = startHour * 60;
+      const businessEndMin = endHour * 60;
+
+      // Build "busy" intervals from appointments
+      const busyIntervals = appointments.filter(a => 
+        a.startMin < businessEndMin && a.endMin > businessStartMin
+      );
+
+      // Find free slots: 30-min slots that have minGapMinutes of free time after them
+      const freeSlots = [];
+      for (let slotMin = businessStartMin; slotMin + minGapMinutes <= businessEndMin; slotMin += slotIntervalMinutes) {
+        const slotEnd = slotMin + minGapMinutes;
+        // Check if this slot overlaps with any busy interval
+        const isBusy = busyIntervals.some(interval => 
+          slotMin < interval.endMin && slotEnd > interval.startMin
+        );
+        if (!isBusy) {
+          freeSlots.push(minutesToTimeStr(slotMin));
         }
       }
 
-      if (slots.length > 0) {
-        results.push({ date: dateStr, dayName, slots });
+      console.log('[find-openings]', dateStr, '- free slots:', freeSlots.join(', '));
+
+      if (freeSlots.length > 0) {
+        results.push({ 
+          date: dateStr, 
+          dayName, 
+          slots: freeSlots.slice(0, 4), // max 4 slots per day
+          appointmentCount: appointments.length
+        });
       }
     }
+
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
 
     return vapiRespond(res, toolCallId, {
       ok: true,
       service,
       results,
-      found: results.length > 0
+      found: results.length > 0,
+      minGapMinutes
     });
   } catch (e) {
     console.error("FIND-OPENINGS error:", e);
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
     return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
   }
 })
