@@ -30,7 +30,7 @@ const scheduleCache = new Map();
 const SCHEDULE_CACHE_TTL_MS = Number(process.env.SCHEDULE_CACHE_TTL_MS || 5 * 60 * 1000);
 
 // How long to wait (ms) for the Playwright booking to finish before timing out
-const BOOK_TIMEOUT_MS = Number(process.env.BOOK_TIMEOUT_MS || 120000);
+const BOOK_TIMEOUT_MS = Number(process.env.BOOK_TIMEOUT_MS || 150000);
 
 function scheduleExpired(entry) {
   return !entry || Date.now() - entry.fetchedAt > SCHEDULE_CACHE_TTL_MS;
@@ -123,7 +123,9 @@ function spokenTime(timeStr) {
   } else {
     minWord = tens[Math.floor(min/10)] + (min % 10 ? ' ' + ones[min % 10] : '');
   }
-  return (hourWord + (minWord ? ' ' + minWord : '') + ' ' + ampm).trim();
+  // Only say AM explicitly — PM is implied for afternoon times
+  const suffix = ampm === 'AM' ? ' AM' : '';
+  return (hourWord + (minWord ? ' ' + minWord : '') + suffix).trim();
 }
 
 
@@ -1235,12 +1237,9 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
   // ── Validation ──────────────────────────────────────────────
   if (!customerName) return vapiError(res, toolCallId, "customerName required");
   if (!customerPhone) return vapiError(res, toolCallId, "customerPhone required");
-  if (isNewClient) {
-    const { firstName, lastName } = splitName(customerName);
-    if (!firstName || !lastName) return vapiError(res, toolCallId, "For new clients, please provide first AND last name.");
-    // Email not required for phone bookings
-    // Email validation not required
-  }
+  // Always require first AND last name — needed for client search AND new client creation
+  { const { firstName: _fn, lastName: _ln } = splitName(customerName);
+    if (!_fn || !_ln) return vapiError(res, toolCallId, "Please provide the customer's first AND last name to complete the booking."); }
   if (!service) return vapiError(res, toolCallId, "service required");
     if (PHONE_BOOKABLE_SERVICES.size) {
     // Fuzzy match: accept if any bookable service contains the requested service name (case-insensitive)
