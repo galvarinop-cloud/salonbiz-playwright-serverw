@@ -11,6 +11,7 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const SALONBIZ_BASE_URL = process.env.SALONBIZ_BASE_URL || "https://central-app.salonbiz.com";
 const SALONBIZ_USERNAME = process.env.SALONBIZ_USERNAME;
+const SALONBIZ_PASSWORD = process.env.SALONBIZ_PASSWORD;
 const CREATE_CLICK_X_PCT = Number(process.env.CREATE_CLICK_X_PCT || 0.95);
 const CREATE_CLICK_Y_PCT = Number(process.env.CREATE_CLICK_Y_PCT || 0.11);
 
