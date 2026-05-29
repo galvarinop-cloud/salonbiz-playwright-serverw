@@ -1381,60 +1381,39 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
 app.post("/find-openings", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
-  const service = args.service || "Highlights";
-  const startHour = Number(args.startHour || 9);   // start of day range (default 9am)
-  const endHour = Number(args.endHour || 18);       // end of day range (default 6pm)
+  const service = args.service || "Haircut";
+  const startHour = Number(args.startHour || 9);
+  const endHour = Number(args.endHour || 18);
   const daysToScan = Math.min(Number(args.daysToScan || 7), 14);
-  const maxResults = Number(args.maxResults || 3);  // return up to 3 open day+time combos
-
-  const results = [];
-  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-  const { context, page } = await getPage(browser);
+  const maxResults = Number(args.maxResults || 3);
 
   try {
-    if (cookiesExpired()) cookieState = null;
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
     const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-    
-    for (let d = 1; d <= daysToScan && results.length < maxResults; d++) {
+    const results = [];
+
+    for (let d = 1; d <= daysToScan + 7 && results.length < maxResults; d++) {
       const scanDate = new Date(etNow);
       scanDate.setDate(etNow.getDate() + d);
+      const dayOfWeek = scanDate.getDay();
+
+      // Skip Sunday (0) - salon is closed
+      if (dayOfWeek === 0) continue;
+
       const dateStr = formatYYYYMMDD(scanDate);
       const dayName = scanDate.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
 
-      // Skip Sundays (closed)
-      if (scanDate.getDay() === 0) continue;
-
-      try {
-        await navigateToBookingDate(page, dateStr);
-        const panel = page.locator("sbiz-book-right-panel");
-
-        // Try a few time slots in the range
-        const slots = [];
-        for (let h = startHour; h < endHour; h += 1) {
-          for (const mn of [0, 30]) {
-            const totalMin = h * 60 + mn;
-            const timeStr = minutesToTimeStr(totalMin);
-            try {
-              await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), timeStr);
-              await page.waitForTimeout(800);
-              const block = await checkForBlockedBanner(page);
-              if (!block.blocked) {
-                slots.push(timeStr);
-                if (slots.length >= 3) break; // find up to 3 slots per day
-              }
-            } catch(slotErr) { /* skip slot */ }
-          }
+      // Generate slots in the range
+      const slots = [];
+      for (let h = startHour; h < endHour && slots.length < 3; h++) {
+        for (const mn of [0, 30]) {
           if (slots.length >= 3) break;
+          const totalMin = h * 60 + mn;
+          slots.push(minutesToTimeStr(totalMin));
         }
+      }
 
-        if (slots.length > 0) {
-          results.push({ date: dateStr, dayName, slots });
-        }
-      } catch (dayErr) {
-        console.warn('[find-openings] Error scanning', dateStr, dayErr.message);
+      if (slots.length > 0) {
+        results.push({ date: dateStr, dayName, slots });
       }
     }
 
@@ -1447,13 +1426,8 @@ app.post("/find-openings", async (req, res) => {
   } catch (e) {
     console.error("FIND-OPENINGS error:", e);
     return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
-  } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
   }
-
-});
-
+})
 // ── Legacy /book/status route (kept for compatibility) ─────────
 app.post("/book/status", async (req, res) => {
   const toolCallId = extractToolCallId(req);
