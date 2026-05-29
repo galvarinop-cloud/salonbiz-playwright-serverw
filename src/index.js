@@ -1214,8 +1214,19 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
     // Email validation not required
   }
   if (!service) return vapiError(res, toolCallId, "service required");
-  if (PHONE_BOOKABLE_SERVICES.size && !PHONE_BOOKABLE_SERVICES.has(service)) {
-    return vapiError(res, toolCallId, `Service "${service}" is not phone-bookable. Choose a different service.`);
+    if (PHONE_BOOKABLE_SERVICES.size) {
+    // Fuzzy match: accept if any bookable service contains the requested service name (case-insensitive)
+    const svcLower = service.toLowerCase();
+    const fuzzyMatch = [...PHONE_BOOKABLE_SERVICES].find(s => 
+      s.toLowerCase().includes(svcLower) || svcLower.includes(s.toLowerCase().split(' with ')[0].toLowerCase())
+    );
+    if (!fuzzyMatch) {
+      return vapiError(res, toolCallId, `Service "${service}" is not phone-bookable. Choose a different service.`);
+    }
+    // Use the exact matched service name if the bot gave a generic name
+    if (service !== fuzzyMatch && !PHONE_BOOKABLE_SERVICES.has(service)) {
+      console.log(`[book] Fuzzy matched service "${service}" -> "${fuzzyMatch}"`);
+    }
   }
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
   if (!startDate) return vapiError(res, toolCallId, "startDate is missing. Please provide the appointment date in YYYY-MM-DD format.");
@@ -1335,8 +1346,8 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
 });
 
 // ── Find openings: reads SalonBiz calendar to find real open slots ──────────
-// Scrapes actual appointments using .dhx_cal_event containers with hidden time text.
-// Finds gaps >= minGapMinutes and returns real available time slots.
+// Strategy: navigate to each day, scrape visible appointment time text using
+// aria-labels and text content, then find gaps >= minGapMinutes.
 app.post("/find-openings", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -1347,15 +1358,6 @@ app.post("/find-openings", async (req, res) => {
   const maxResults = Number(args.maxResults || 3);
   const minGapMinutes = Number(args.minGapMinutes || 60);
   const slotIntervalMinutes = 30;
-
-  // DHtmlX scheduler pixel constants (SalonBiz uses DHtmlX)
-  // Calendar starts at 7:00 AM = top:0, scale is 0.852px per minute
-  const CALENDAR_START_HOUR = 7;
-  const PX_PER_MIN = 25.555 / 30; // ~0.852
-
-  function dhxPixelToMinutes(px) {
-    return Math.round(CALENDAR_START_HOUR * 60 + px / PX_PER_MIN);
-  }
 
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
   const { context, page } = await getPage(browser);
@@ -1379,53 +1381,122 @@ app.post("/find-openings", async (req, res) => {
 
       try {
         await navigateToDate(page, dateStr);
-        await page.waitForTimeout(2500);
+        await page.waitForTimeout(3000); // Wait for calendar to fully render
       } catch (e) {
         console.warn('[find-openings] navigateToDate failed for', dateStr, ':', e.message);
         continue;
       }
 
-      // Scrape appointments using DHtmlX event blocks
-      // Each .dhx_cal_event that contains .scheduler-appointment-block__container is a real appointment
-      const appointments = await page.evaluate((args) => {
-        const { calStartHour, pxPerMin } = args;
-        const events = document.querySelectorAll('.dhx_cal_event');
+      // Scrape appointments by reading text content from event blocks
+      // Each appointment block has time info in aria-label or inner text
+      const appointments = await page.evaluate(() => {
         const appts = [];
+        
+        // Method 1: Try aria-label on event containers (most reliable)
+        const events = document.querySelectorAll('[class*="dhx_cal_event"], [class*="appointment"], [class*="event-block"]');
         for (const ev of events) {
-          const block = ev.querySelector('.scheduler-appointment-block__container');
-          if (!block) continue; // Not an appointment (might be blocked time)
-          const style = ev.getAttribute('style') || '';
-          const topMatch = style.match(/top:(\d+(?:\.\d+)?)px/);
-          const heightMatch = style.match(/height:(\d+(?:\.\d+)?)px/);
-          if (!topMatch || !heightMatch) continue;
-          const topPx = parseFloat(topMatch[1]);
-          const heightPx = parseFloat(heightMatch[1]);
-          // Convert pixels to minutes from midnight
-          const startMin = Math.round(calStartHour * 60 + topPx / pxPerMin);
-          const durationMin = Math.round(heightPx / pxPerMin);
-          const endMin = startMin + Math.max(durationMin, 15); // at least 15 min
-          appts.push({ startMin, endMin });
+          const label = ev.getAttribute('aria-label') || '';
+          const text = ev.textContent || '';
+          const combined = label + ' ' + text;
+          
+          // Look for time patterns like "9:00 AM", "10:30 AM", "2:00 PM" in the text
+          const timePattern = /\b(\d{1,2}):(\d{2})\s*(AM|PM)\b/gi;
+          const times = [];
+          let match;
+          while ((match = timePattern.exec(combined)) !== null) {
+            let h = parseInt(match[1]);
+            const m = parseInt(match[2]);
+            const ampm = match[3].toUpperCase();
+            if (ampm === 'AM' && h === 12) h = 0;
+            if (ampm === 'PM' && h !== 12) h += 12;
+            times.push(h * 60 + m);
+          }
+          
+          if (times.length >= 2) {
+            times.sort((a, b) => a - b);
+            appts.push({ startMin: times[0], endMin: times[times.length - 1] });
+          } else if (times.length === 1) {
+            // Single time found, assume at least 30 min duration
+            appts.push({ startMin: times[0], endMin: times[0] + 30 });
+          }
         }
+        
+        // Method 2: Use pixel position as fallback if we got nothing
+        if (appts.length === 0) {
+          // DHtmlX calendar: find event blocks with style="top:Xpx; height:Ypx"
+          // Calendar starts at 7:00 AM. Pixel scale: look at time ruler
+          const ruler = document.querySelector('.dhx_cal_scale_placeholder, [class*="time_ruler"], [class*="time-ruler"]');
+          let pxPerHour = 40; // default estimate
+          
+          // Try to measure actual px per hour from time labels
+          const timeLabels = document.querySelectorAll('.dhx_scale_hour, [class*="hour_label"], [class*="time-label"]');
+          const labelData = [];
+          for (const lbl of timeLabels) {
+            const text = lbl.textContent.trim();
+            const match = text.match(/^(\d{1,2}):?(\d{0,2})\s*(AM|PM)?$/i);
+            if (!match) continue;
+            let h = parseInt(match[1]);
+            if (match[3] && match[3].toUpperCase() === 'PM' && h !== 12) h += 12;
+            if (match[3] && match[3].toUpperCase() === 'AM' && h === 12) h = 0;
+            const bb = lbl.getBoundingClientRect();
+            if (bb.height > 0) labelData.push({ hour: h, y: bb.top });
+          }
+          
+          if (labelData.length >= 2) {
+            labelData.sort((a, b) => a.y - b.y);
+            const dy = labelData[1].y - labelData[0].y;
+            const dh = labelData[1].hour - labelData[0].hour;
+            if (dy > 0 && dh > 0) pxPerHour = dy / dh;
+          }
+          
+          const firstLabelY = labelData.length > 0 ? labelData[0].y : 0;
+          const firstLabelHour = labelData.length > 0 ? labelData[0].hour : 7;
+          
+          const eventBlocks = document.querySelectorAll('[class*="dhx_cal_event"][style*="top"]');
+          for (const ev of eventBlocks) {
+            const container = ev.querySelector('[class*="appointment-block"], [class*="event-content"]');
+            if (!container && !ev.textContent.trim()) continue;
+            
+            const style = ev.getAttribute('style') || '';
+            const topMatch = style.match(/top:\s*(\d+(?:\.\d+)?)px/);
+            const heightMatch = style.match(/height:\s*(\d+(?:\.\d+)?)px/);
+            if (!topMatch || !heightMatch) continue;
+            
+            const topPx = parseFloat(topMatch[1]);
+            const heightPx = parseFloat(heightMatch[1]);
+            const bb = ev.getBoundingClientRect();
+            
+            // Convert using measured scale
+            const startMin = Math.round(firstLabelHour * 60 + (bb.top - firstLabelY) / pxPerHour * 60);
+            const durationMin = Math.max(30, Math.round(heightPx / pxPerHour * 60));
+            
+            if (startMin >= 0 && startMin < 24 * 60) {
+              appts.push({ startMin, endMin: startMin + durationMin });
+            }
+          }
+        }
+        
         return appts;
-      }, { calStartHour: CALENDAR_START_HOUR, pxPerMin: PX_PER_MIN });
+      });
 
-      console.log('[find-openings]', dateStr, '- scraped', appointments.length, 'appointments');
+      console.log('[find-openings]', dateStr, '- scraped', appointments.length, 'appointments', JSON.stringify(appointments.map(a => ({s: a.startMin, e: a.endMin}))));
       appointments.sort((a, b) => a.startMin - b.startMin);
 
-      // Find free slots with at least minGapMinutes of free time
+      // Find free slots with at least minGapMinutes of continuous free time
       const businessStartMin = startHour * 60;
       const businessEndMin = endHour * 60;
 
       const freeSlots = [];
       for (let slotMin = businessStartMin; slotMin + minGapMinutes <= businessEndMin; slotMin += slotIntervalMinutes) {
         const slotEnd = slotMin + minGapMinutes;
+        // A slot is free if no appointment overlaps with [slotMin, slotEnd)
         const isBusy = appointments.some(a => slotMin < a.endMin && slotEnd > a.startMin);
         if (!isBusy) {
           freeSlots.push(minutesToTimeStr(slotMin));
         }
       }
 
-      console.log('[find-openings]', dateStr, '- free slots:', freeSlots.slice(0, 4).join(', '));
+      console.log('[find-openings]', dateStr, '- free slots (with', minGapMinutes, 'min gap):', freeSlots.slice(0, 4).join(', '));
 
       if (freeSlots.length > 0) {
         results.push({ date: dateStr, dayName, slots: freeSlots.slice(0, 4), appointmentCount: appointments.length });
@@ -1448,7 +1519,7 @@ app.post("/find-openings", async (req, res) => {
     await browser.close().catch(() => {});
     return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
   }
-})
+});
 // ── Legacy /book/status route (kept for compatibility) ─────────
 app.post("/book/status", async (req, res) => {
   const toolCallId = extractToolCallId(req);
