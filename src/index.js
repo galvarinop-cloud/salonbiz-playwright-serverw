@@ -101,6 +101,32 @@ function minutesToTimeStr(m) {
   const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
   return `${h12}:${String(min).padStart(2,"0")} ${ampm}`;
 }
+// Convert a time string like "1:30 PM" to spoken form "one thirty PM"
+function spokenTime(timeStr) {
+  if (!timeStr) return timeStr;
+  const m = String(timeStr).trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (!m) return timeStr;
+  const h = parseInt(m[1]);
+  const min = parseInt(m[2]);
+  const ampm = m[3].toUpperCase();
+  const ones = ['','one','two','three','four','five','six','seven','eight','nine','ten','eleven','twelve'];
+  const teens = ['ten','eleven','twelve','thirteen','fourteen','fifteen','sixteen','seventeen','eighteen','nineteen'];
+  const tens = ['','','twenty','thirty','forty','fifty'];
+  let hourWord = h <= 12 ? ones[h] : ones[h-12];
+  let minWord = '';
+  if (min === 0) {
+    minWord = '';
+  } else if (min < 10) {
+    minWord = 'oh ' + ones[min];
+  } else if (min < 20) {
+    minWord = teens[min - 10];
+  } else {
+    minWord = tens[Math.floor(min/10)] + (min % 10 ? ' ' + ones[min % 10] : '');
+  }
+  return (hourWord + (minWord ? ' ' + minWord : '') + ' ' + ampm).trim();
+}
+
+
 
 // Normalize loose voice time strings → "5:00 PM"
 // Handles: "2:30 PM", "two thirty PM", "3 PM", "three", "14:30", digit-word combos
@@ -1494,7 +1520,7 @@ app.post("/find-openings", async (req, res) => {
         // A slot is free if no appointment overlaps with [slotMin, slotEnd)
         const isBusy = appointments.some(a => slotMin < a.endMin && slotEnd > a.startMin);
         if (!isBusy) {
-          freeSlots.push(minutesToTimeStr(slotMin));
+          freeSlots.push(spokenTime(minutesToTimeStr(slotMin)));
         }
       }
 
