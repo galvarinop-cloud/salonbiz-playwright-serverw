@@ -679,218 +679,230 @@ async function selectExistingClient(page, nameStr, phoneStr) {
   const panel = page.locator("sbiz-book-right-panel");
   const { firstName, lastName } = splitName(nameStr);
   const phoneDigits = digitsOnly(phoneStr || '').slice(-10);
-
   const inlineInput = panel.locator('input[placeholder="Search by name or contact"]').first();
   await inlineInput.waitFor({ state: "visible", timeout: 15000 });
   await inlineInput.click();
   await inlineInput.fill("");
   await inlineInput.type(lastName || firstName, { delay: 25 });
   await page.waitForTimeout(300);
-
   const inlineSearchBtn = panel.locator('sbiz-search-client button:has-text("Search")').first();
   await inlineSearchBtn.click({ timeout: 10000 });
   await page.waitForTimeout(1500);
-
   const modal = page.locator("ngb-modal-window").first();
   await modal.waitFor({ state: "visible", timeout: 12000 });
   await page.waitForTimeout(800);
-
   const modalSearchBtn = modal.locator('button:has-text("Search")').first();
   const fnField = modal.locator('input[formcontrolname="firstName"]').first();
   const lnField = modal.locator('input[formcontrolname="lastName"]').first();
   const ctField = modal.locator('input[formcontrolname="contact"]').first();
-
-  const setAngularInput = async (locator, value) => {
-    if (!(await locator.isVisible().catch(()=>false))) return;
-    await locator.evaluate((el, val) => {
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-      setter.call(el, val);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      el.dispatchEvent(new Event('blur', { bubbles: true }));
-    }, String(value));
+  const setAI = async (loc, val) => {
+    if (!(await loc.isVisible().catch(()=>false))) return;
+    await loc.evaluate((el, v) => {
+      const s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      s.call(el, v); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); el.dispatchEvent(new Event('blur',{bubbles:true}));
+    }, String(val));
     await page.waitForTimeout(100);
   };
-
   if (phoneDigits.length >= 7) {
-    await setAngularInput(fnField, '');
-    await setAngularInput(lnField, '');
-    await setAngularInput(ctField, phoneDigits);
-    if (await ctField.isVisible().catch(()=>false)) {
-      await ctField.click({ clickCount: 3 });
-      await ctField.type(phoneDigits, { delay: 20 });
-    }
+    await setAI(fnField,''); await setAI(lnField,''); await setAI(ctField, phoneDigits);
+    if (await ctField.isVisible().catch(()=>false)) { await ctField.click({clickCount:3}); await ctField.type(phoneDigits,{delay:20}); }
     await page.waitForTimeout(200);
-    await modalSearchBtn.click({ timeout: 10000 });
+    await modalSearchBtn.click({timeout:10000});
     await page.waitForTimeout(3000);
   }
-
   const rows = modal.locator("table tbody tr");
-  let rowCount = await rows.count().catch(() => 0);
-  console.log("[selectClient] Phone search rows:", rowCount);
-
+  let rowCount = await rows.count().catch(()=>0);
+  console.log("[selectClient] Phone rows:", rowCount);
   if (rowCount === 0) {
-    await setAngularInput(fnField, firstName);
-    await setAngularInput(lnField, lastName);
-    await setAngularInput(ctField, '');
+    await setAI(fnField, firstName); await setAI(lnField, lastName); await setAI(ctField,'');
     if (await fnField.isVisible().catch(()=>false)) { await fnField.click({clickCount:3}); await fnField.type(firstName,{delay:20}); }
     if (await lnField.isVisible().catch(()=>false)) { await lnField.click({clickCount:3}); await lnField.type(lastName,{delay:20}); }
     await page.waitForTimeout(200);
-    await modalSearchBtn.click({ timeout: 10000 });
+    await modalSearchBtn.click({timeout:10000});
     await page.waitForTimeout(3000);
-    rowCount = await rows.count().catch(() => 0);
-    console.log("[selectClient] Name search rows:", rowCount);
+    rowCount = await rows.count().catch(()=>0);
+    console.log("[selectClient] Name rows:", rowCount);
   }
-
   if (rowCount === 0) {
-    await page.screenshot({ path: "/tmp/client_search_failed.png", fullPage: true }).catch(() => {});
-    await modal.locator('button:has-text("Close"), button[aria-label="Close"]').first().evaluate(el => el.click()).catch(() => page.keyboard.press("Escape"));
+    await page.screenshot({path:"/tmp/client_search_failed.png",fullPage:true}).catch(()=>{});
+    await modal.locator('button:has-text("Close"),button[aria-label="Close"]').first().evaluate(el=>el.click()).catch(()=>page.keyboard.press("Escape"));
     await page.waitForTimeout(500);
-    throw new Error('Client not found: "' + nameStr + '" phone:' + phoneStr);
+    throw new Error('Client not found: "'+nameStr+'" phone:'+phoneStr);
   }
-
-  let bestRow = 0;
-  if (phoneDigits.length >= 7) {
-    const shortPhone = phoneDigits.slice(-7);
-    for (let i = 0; i < rowCount; i++) {
-      const txt = await rows.nth(i).innerText().catch(() => "");
-      if (digitsOnly(txt).includes(shortPhone)) { bestRow = i; break; }
-    }
+  let best = 0;
+  if (phoneDigits.length>=7) {
+    const sp = phoneDigits.slice(-7);
+    for (let i=0;i<rowCount;i++) { const t=await rows.nth(i).innerText().catch(()=>""); if(digitsOnly(t).includes(sp)){best=i;break;} }
   }
-  console.log("[selectClient] Clicking row", bestRow, "of", rowCount);
-
-  await rows.nth(bestRow).scrollIntoViewIfNeeded().catch(()=>{});
+  console.log("[selectClient] Clicking row", best, "of", rowCount);
+  await rows.nth(best).scrollIntoViewIfNeeded().catch(()=>{});
   await page.waitForTimeout(300);
-  await rows.nth(bestRow).evaluate(el => el.click());
+  await rows.nth(best).evaluate(el=>el.click());
   await page.waitForTimeout(1000);
-
-  const selectBtn = modal.locator('button:has-text("Select")').first();
-  if (await selectBtn.isVisible().catch(()=>false)) {
-    await selectBtn.evaluate(el => el.click());
-    console.log("[selectClient] Clicked Select");
-  } else {
-    await rows.nth(bestRow).click({ timeout: 5000 }).catch(()=>{});
+  const selBtn = modal.locator('button:has-text("Select")').first();
+  if (await selBtn.isVisible().catch(()=>false)) { await selBtn.evaluate(el=>el.click()); console.log("[selectClient] Select clicked"); }
+  else {
+    await rows.nth(best).click({timeout:5000}).catch(()=>{});
     await page.waitForTimeout(500);
-    const sb2 = modal.locator('button:has-text("Select")').first();
-    if (await sb2.isVisible().catch(()=>false)) await sb2.evaluate(el => el.click());
+    const s2 = modal.locator('button:has-text("Select")').first();
+    if (await s2.isVisible().catch(()=>false)) await s2.evaluate(el=>el.click());
   }
-
-  await modal.waitFor({ state: "hidden", timeout: 12000 }).catch(async () => {
-    console.warn("[selectClient] Modal still open");
-    await page.screenshot({ path: "/tmp/client_search_failed.png", fullPage: true }).catch(()=>{});
-    const sb3 = modal.locator('button:has-text("Select")').first();
-    if (await sb3.isVisible().catch(()=>false)) await sb3.evaluate(el => el.click());
+  await modal.waitFor({state:"hidden",timeout:12000}).catch(async()=>{
+    await page.screenshot({path:"/tmp/client_search_failed.png",fullPage:true}).catch(()=>{});
+    const s3 = modal.locator('button:has-text("Select")').first();
+    if (await s3.isVisible().catch(()=>false)) await s3.evaluate(el=>el.click());
     await page.waitForTimeout(2000);
   });
   await page.waitForTimeout(600);
-  console.log("[selectClient] Complete");
 }
 async function createNewClientInModal(page, { customerName, customerPhone, customerEmail }) {
   const modal = page.locator("ngb-modal-window").first();
-  await modal.waitFor({ state: "visible", timeout: 20000 });
-
+  await modal.waitFor({state:"visible",timeout:20000});
   const { firstName, lastName } = splitName(customerName);
-  if (!firstName || !lastName) throw new Error("New client requires first AND last name.");
-
-  const fillField = async (locator, value) => {
-    await locator.waitFor({ state: "visible", timeout: 8000 });
-    await locator.scrollIntoViewIfNeeded().catch(() => {});
-    await locator.evaluate((el, val) => {
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-      setter.call(el, '');
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      setter.call(el, val);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      el.dispatchEvent(new Event('blur', { bubbles: true }));
-    }, String(value));
+  if (!firstName||!lastName) throw new Error("New client requires first AND last name.");
+  const fill = async (loc, val) => {
+    await loc.waitFor({state:"visible",timeout:8000});
+    await loc.scrollIntoViewIfNeeded().catch(()=>{});
+    await loc.evaluate((el,v) => {
+      const s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+      s.call(el,''); el.dispatchEvent(new Event('input',{bubbles:true}));
+      s.call(el,v); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); el.dispatchEvent(new Event('blur',{bubbles:true}));
+    }, String(val));
     await page.waitForTimeout(100);
-    const actual = await locator.inputValue().catch(() => '');
-    if (!actual || actual !== String(value)) {
-      await locator.click({ clickCount: 3 });
-      await page.keyboard.press('Control+a');
-      await page.keyboard.press('Delete');
-      await locator.type(String(value), { delay: 20 });
-      await locator.press('Tab');
-      await page.waitForTimeout(150);
+    const actual = await loc.inputValue().catch(()=>'');
+    if (!actual || actual!==String(val)) {
+      await loc.click({clickCount:3}); await page.keyboard.press('Control+a'); await page.keyboard.press('Delete');
+      await loc.type(String(val),{delay:20}); await loc.press('Tab'); await page.waitForTimeout(150);
     }
   };
-
-  await modal.evaluate(el => {
-    const body = el.querySelector('.modal-body, .sbiz-modal__body, .modal-content');
-    if (body) body.scrollTop = 0;
-    el.scrollTop = 0;
-  }).catch(() => {});
+  await modal.evaluate(el=>{const b=el.querySelector('.modal-body,.sbiz-modal__body,.modal-content');if(b)b.scrollTop=0;el.scrollTop=0;}).catch(()=>{});
   await page.waitForTimeout(300);
-
-  const fnInput = modal.locator('input[formcontrolname="firstName"]').first();
-  const lnInput = modal.locator('input[formcontrolname="lastName"]').first();
-  const telInput = modal.locator('input[formcontrolname="telMobile"]').first();
-
-  await fillField(fnInput, firstName);
-  await fillField(lnInput, lastName);
-  await fillField(telInput, formatUsPhoneMaybe(customerPhone));
-
+  const fnI = modal.locator('input[formcontrolname="firstName"]').first();
+  const lnI = modal.locator('input[formcontrolname="lastName"]').first();
+  const telI = modal.locator('input[formcontrolname="telMobile"]').first();
+  await fill(fnI, firstName);
+  await fill(lnI, lastName);
+  await fill(telI, formatUsPhoneMaybe(customerPhone));
   if (customerEmail && isValidEmail(customerEmail)) {
-    const emailInput = modal.locator('input[formcontrolname="email"]').first();
-    if (await emailInput.isVisible().catch(() => false)) await fillField(emailInput, customerEmail);
+    const emailI = modal.locator('input[formcontrolname="email"]').first();
+    if (await emailI.isVisible().catch(()=>false)) await fill(emailI, customerEmail);
   }
-
   await page.waitForTimeout(600);
-  await page.screenshot({ path: "/tmp/new_client_before_create.png", fullPage: true }).catch(() => {});
-
+  await page.screenshot({path:"/tmp/new_client_before_create.png",fullPage:true}).catch(()=>{});
   const createBtn = modal.locator('button:has-text("Create")').last();
-  await createBtn.scrollIntoViewIfNeeded().catch(() => {});
+  await createBtn.scrollIntoViewIfNeeded().catch(()=>{});
   await page.waitForTimeout(300);
-  await createBtn.evaluate(el => el.click());
+  await createBtn.evaluate(el=>el.click());
   await page.waitForTimeout(3000);
-
-  let stillOpen = await modal.isVisible().catch(() => false);
-
-  if (stillOpen) {
-    await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
-    const errors = await modal.locator('.sbiz-alert, .alert-danger, .invalid-feedback, .text-danger, [class*="error"]').allInnerTexts().catch(() => []);
-    const errTxt = errors.join(' ').toLowerCase();
-    console.log("[createNewClient] Errors:", errTxt || "(none)");
-    if (errTxt.includes('already') || errTxt.includes('exist') || errTxt.includes('duplicate') || errTxt.includes('found')) {
-      await modal.locator('button:has-text("Close"), button[aria-label="Close"]').first().evaluate(el => el.click()).catch(() => page.keyboard.press("Escape"));
+  let open = await modal.isVisible().catch(()=>false);
+  if (open) {
+    await page.screenshot({path:"/tmp/new_client_submit_failed.png",fullPage:true}).catch(()=>{});
+    const errs = await modal.locator('.sbiz-alert,.alert-danger,.invalid-feedback,.text-danger,[class*="error"]').allInnerTexts().catch(()=>[]);
+    const et = errs.join(' ').toLowerCase();
+    console.log("[createNew] Errors:", et||"(none)");
+    if (et.includes('already')||et.includes('exist')||et.includes('duplicate')||et.includes('found')) {
+      await modal.locator('button:has-text("Close"),button[aria-label="Close"]').first().evaluate(el=>el.click()).catch(()=>page.keyboard.press("Escape"));
       await page.waitForTimeout(500);
       throw new Error("DUPLICATE_CLIENT");
     }
-    await fillField(fnInput, firstName);
-    await fillField(lnInput, lastName);
-    await fillField(telInput, formatUsPhoneMaybe(customerPhone));
+    await fill(fnI,firstName); await fill(lnI,lastName); await fill(telI,formatUsPhoneMaybe(customerPhone));
     await page.waitForTimeout(400);
-    await createBtn.click({ timeout: 10000 }).catch(() => {});
+    await createBtn.click({timeout:10000}).catch(()=>{});
     await page.waitForTimeout(3000);
-    stillOpen = await modal.isVisible().catch(() => false);
+    open = await modal.isVisible().catch(()=>false);
   }
-
-  if (stillOpen) {
-    await page.keyboard.press("Enter");
-    await page.waitForTimeout(2000);
-    stillOpen = await modal.isVisible().catch(() => false);
-  }
-
-  if (stillOpen) {
-    await modal.evaluate(el => {
-      const form = el.querySelector('form');
-      if (form) form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    }).catch(() => {});
-    await page.waitForTimeout(2000);
-    stillOpen = await modal.isVisible().catch(() => false);
-  }
-
-  if (stillOpen) {
-    await page.screenshot({ path: "/tmp/new_client_submit_failed.png", fullPage: true }).catch(() => {});
-    throw new Error("New client modal did not close after create.");
-  }
-
-  await modal.waitFor({ state: "hidden", timeout: 20000 }).catch(() => {});
+  if (open) { await page.keyboard.press("Enter"); await page.waitForTimeout(2000); open=await modal.isVisible().catch(()=>false); }
+  if (open) { await modal.evaluate(el=>{const f=el.querySelector('form');if(f)f.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));}).catch(()=>{}); await page.waitForTimeout(2000); open=await modal.isVisible().catch(()=>false); }
+  if (open) { await page.screenshot({path:"/tmp/new_client_submit_failed.png",fullPage:true}).catch(()=>{}); throw new Error("New client modal did not close after create."); }
+  await modal.waitFor({state:"hidden",timeout:20000}).catch(()=>{});
   await page.waitForTimeout(800);
-  console.log("[createNewClient] Complete");
+  console.log("[createNew] Complete");
 }
 
+async function clickFinalAppointmentCreate(page) {
+  const panel = page.locator("sbiz-book-right-panel");
+  const candidates = [
+    panel.locator('.sbiz-btn--primary:has-text("Create")'),
+    panel.locator('button.sbiz-btn--primary:has-text("Create")'),
+    panel.locator('button[type="submit"]:has-text("Create")'),
+    panel.locator('button:has-text("Create")')
+  ];
+  for (const loc of candidates) {
+    const count = await loc.count().catch(() => 0);
+    if (count > 0) {
+      const btn = loc.last();
+      const visible = await btn.isVisible().catch(() => false);
+      if (visible) { await btn.click({ timeout: 15000 }); return true; }
+    }
+  }
+  return false;
+}
+
+async function checkForBlockedBanner(page) {
+  await page.waitForTimeout(1200);
+  const blockedBanner = page.locator("text=/blocked by/i").first();
+  const isBlocked = await blockedBanner.isVisible().catch(() => false);
+  if (isBlocked) {
+    const bannerText = await blockedBanner.innerText().catch(() => "Blocked by staff");
+    return { blocked: true, reason: bannerText };
+  }
+  return { blocked: false };
+}
+
+/**
+ * Core booking function - runs the full Playwright booking flow.
+ */
+async function runBooking(page, { isNewClient, customerName, customerPhone, customerEmail, service, stylist, startTime, startDate, customDuration, requestReason }) {
+  if (!startDate) throw new Error("startDate is required in YYYY-MM-DD format");
+
+  await navigateToBookingDate(page, startDate);
+
+  if (isNewClient) {
+    await clickClientCreateButton(page);
+    await createNewClientInModal(page, { customerName, customerPhone, customerEmail });
+  } else {
+    // Strategy 1: Find existing client by name + phone
+    let clientFound = false;
+    try {
+      await selectExistingClient(page, customerName, customerPhone);
+      clientFound = true;
+      console.log("[runBooking] Found existing client:", customerName);
+    } catch (e) {
+      console.log("[runBooking] selectExistingClient failed:", e.message);
+      await page.screenshot({ path: "/tmp/client_search_failed.png", fullPage: true }).catch(() => {});
+    }
+
+    if (!clientFound) {
+      // Strategy 2: Re-navigate and try selectExistingClient again (fresh state)
+      console.log("[runBooking] Retrying client search...");
+      await navigateToBookingDate(page, startDate);
+      try {
+        await selectExistingClient(page, customerName, customerPhone);
+        clientFound = true;
+        console.log("[runBooking] Found existing client on retry:", customerName);
+      } catch (e2) {
+        console.log("[runBooking] Retry also failed:", e2.message);
+      }
+    }
+
+    if (!clientFound) {
+      // Strategy 3: Create as new client (they may be genuinely new, or search may have failed)
+      console.log("[runBooking] Creating client as new:", customerName);
+      await navigateToBookingDate(page, startDate);
+      await clickClientCreateButton(page);
+      try {
+        await createNewClientInModal(page, { customerName, customerPhone, customerEmail: customerEmail || "" });
+      } catch (createErr) {
+        // Check if it's a duplicate client error - if so, try selecting existing
+        if (String(createErr.message).includes('DUPLICATE_CLIENT')) {
+          console.log("[runBooking] Duplicate client detected, trying to select existing...");
+          await navigateToBookingDate(page, startDate);
+          await selectExistingClient(page, customerName, customerPhone);
+        } else {
+          throw createErr;
+        }
+      }
+    }
   }
 
   const panel = page.locator("sbiz-book-right-panel");
