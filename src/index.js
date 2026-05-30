@@ -322,10 +322,28 @@ async function clickClientCreateButton(page) {
 }
 
 async function ensureCreatePanelOpen(page) {
-  const si = page.locator("sbiz-book-right-panel").locator('input[formcontrolname="service"]').first();
+  const panel = page.locator("sbiz-book-right-panel");
+  const si = panel.locator('input[formcontrolname="service"]').first();
   if (await si.isVisible().catch(() => false)) return si;
+
   await clickPinkCreateButton(page);
-  await si.waitFor({ state: "visible", timeout: 20000 });
+  await page.waitForTimeout(1500);
+  if (await si.isVisible().catch(() => false)) return si;
+
+  const createBtns = [
+    page.locator('button:has-text("New Appointment")').first(),
+    page.locator('button:has-text("Create Appointment")').first(),
+    page.locator('sbiz-appointment-book-header button').last(),
+  ];
+  for (const btn of createBtns) {
+    if (await btn.isVisible().catch(() => false)) {
+      await btn.click({ timeout: 8000 });
+      await page.waitForTimeout(1500);
+      if (await si.isVisible().catch(() => false)) return si;
+    }
+  }
+
+  await si.waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
   return si;
 }
 
@@ -1026,6 +1044,22 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
   }
 
   const panel = page.locator("sbiz-book-right-panel");
+
+  // Wait for service input to appear after client selection
+  {
+    const svcInput = panel.locator('input[formcontrolname="service"]').first();
+    let svcVisible = await svcInput.isVisible().catch(() => false);
+    if (!svcVisible) {
+      console.log('[runBooking] Waiting for service input after client select...');
+      await page.waitForTimeout(2500);
+      svcVisible = await svcInput.isVisible().catch(() => false);
+    }
+    if (!svcVisible) {
+      console.log('[runBooking] Still not visible, calling ensureCreatePanelOpen...');
+      await ensureCreatePanelOpen(page);
+    }
+  }
+
   await selectService(page, service);
   if (stylist) await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
   await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
@@ -1131,21 +1165,27 @@ app.post("/schedule", async (req, res) => {
   const args = extractArgs(req);
   const dateStr = args.date || args.startDate || todayStr();
 
-  // Hardcoded active stylists — no Playwright needed, responds instantly
+  const hours = getSalonHours(dateStr);
   const ACTIVE_STYLISTS = ["Adria", "Breanna", "Daniela", "Katie", "Kendra", "Lyndsie"];
-  const defaultSchedule = ACTIVE_STYLISTS.map(name => ({
-    name,
-    isWorking: true,
-    notWorkingPeriods: []
-  }));
 
+  if (!hours) {
+    const closedSchedule = ACTIVE_STYLISTS.map(name => ({
+      name, isWorking: false, notWorkingPeriods: [{ startMin: 0, endMin: 1440 }]
+    }));
+    console.log('[schedule] Closed day for', dateStr);
+    return vapiRespond(res, toolCallId, {
+      ok: true, date: dateStr, closed: true, stylistCount: 0,
+      schedule: closedSchedule, note: 'salon-closed'
+    });
+  }
+
+  const defaultSchedule = ACTIVE_STYLISTS.map(name => ({
+    name, isWorking: true, notWorkingPeriods: []
+  }));
   console.log('[schedule] Returning instant schedule for', dateStr);
   return vapiRespond(res, toolCallId, {
-    ok: true,
-    date: dateStr,
-    stylistCount: defaultSchedule.length,
-    schedule: defaultSchedule,
-    note: 'from-cache'
+    ok: true, date: dateStr, closed: false,
+    stylistCount: defaultSchedule.length, schedule: defaultSchedule, note: 'from-cache'
   });
 });
 
@@ -1251,6 +1291,29 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
   }
   if (!startTime) return vapiError(res, toolCallId, "startTime required (e.g., '2:00 PM')");
   if (!startDate) return vapiError(res, toolCallId, "startDate is missing. Please provide the appointment date in YYYY-MM-DD format.");
+
+  // ── Closed day check ────────────────────────────────────────
+  {
+    const salonHrs = getSalonHours(startDate);
+    if (!salonHrs) {
+      const d = new Date(startDate + 'T12:00:00');
+      const dayName = d.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
+      let nextOpenDay = '';
+      for (let i = 1; i <= 7; i++) {
+        const nd = new Date(d); nd.setDate(d.getDate() + i);
+        if (getSalonHours(formatYYYYMMDD(nd))) {
+          nextOpenDay = nd.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
+          break;
+        }
+      }
+      console.log('[book] Rejected: closed day', startDate, dayName);
+      return vapiRespond(res, toolCallId, {
+        ok: false, booked: false, closed: true,
+        reason: 'The salon is closed on ' + dayName + 's. Next available day is ' + nextOpenDay + '.',
+        message: 'The salon is closed on ' + dayName + 's. Next available day is ' + nextOpenDay + '.'
+      });
+    }
+  }
 
   // ── Schedule pre-check ──────────────────────────────────────
   if (stylist) {
