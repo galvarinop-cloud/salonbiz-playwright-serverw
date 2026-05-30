@@ -680,183 +680,200 @@ async function selectService(page, serviceStr) {
 async function selectExistingClient(page, nameStr, phoneStr) {
   const { firstName, lastName } = splitName(nameStr);
   const phoneDigits = digitsOnly(phoneStr || '').slice(-10);
-  console.log('[selectClient] searching for', nameStr, 'phone:', phoneDigits);
+  console.log('[selectClient] START searching for:', nameStr, 'phone:', phoneDigits);
 
-  // Step 1: Find and click the Client search input in the booking panel
-  // Use page.evaluate to find the right input field
-  await page.evaluate(() => {
-    // Find the sbiz-search-client component's input
-    const inputs = document.querySelectorAll('sbiz-book-right-panel input, sbiz-search-client input');
-    for (const inp of inputs) {
-      const ph = inp.getAttribute('placeholder') || '';
-      if (ph.toLowerCase().includes('search') || ph.toLowerCase().includes('name') || ph.toLowerCase().includes('contact')) {
-        inp.click();
-        inp.focus();
-        console.log('[selectClient] found input:', ph);
-        return true;
-      }
-    }
-    // Fallback: click first visible input in panel
-    const panel = document.querySelector('sbiz-book-right-panel') || document.querySelector('[class*="right-panel"]');
-    if (panel) {
-      const inp = panel.querySelector('input');
-      if (inp) { inp.click(); inp.focus(); return true; }
-    }
-    return false;
-  });
-  await page.waitForTimeout(300);
+  // Use the panel locator
+  const panel = page.locator('sbiz-book-right-panel');
 
-  // Step 2: Clear and type the last name
+  // Step 1: Find the inline client search input
+  // Try multiple selectors
+  const inputSelectors = [
+    'sbiz-search-client input[placeholder*="Search"]',
+    'sbiz-search-client input[placeholder*="name"]',
+    'sbiz-search-client input',
+    '[class*="client"] input[type="text"]',
+    'input[placeholder*="Search by name"]'
+  ];
+
+  let inlineInput = null;
+  for (const sel of inputSelectors) {
+    const loc = panel.locator(sel).first();
+    const visible = await loc.isVisible().catch(() => false);
+    if (visible) {
+      inlineInput = loc;
+      console.log('[selectClient] found input with selector:', sel);
+      break;
+    }
+  }
+
+  if (!inlineInput) {
+    // Last resort: get all inputs in panel
+    const inputs = panel.locator('input');
+    const count = await inputs.count().catch(() => 0);
+    console.log('[selectClient] input count in panel:', count);
+    if (count > 0) inlineInput = inputs.first();
+  }
+
+  if (!inlineInput) {
+    throw new Error('Client not found: could not find search input in booking panel');
+  }
+
+  // Step 2: Click and type search term
   const searchTerm = lastName || firstName;
-  console.log('[selectClient] typing search term:', searchTerm);
+  console.log('[selectClient] typing:', searchTerm);
+  await inlineInput.click({ timeout: 10000 });
+  await inlineInput.fill(searchTerm);
+  await page.waitForTimeout(500);
 
-  // Use keyboard to clear and type
-  await page.keyboard.press('Control+a');
-  await page.keyboard.press('Backspace');
-  await page.waitForTimeout(100);
-  for (const ch of searchTerm) {
-    await page.keyboard.type(ch, { delay: 30 });
+  // Step 3: Find and click the Search button
+  const searchBtnSelectors = [
+    'sbiz-search-client button:has-text("Search")',
+    'panel sbiz-book-right-panel button:has-text("Search")',
+    'button:has-text("Search")',
+  ];
+
+  let searchBtn = null;
+  for (const sel of searchBtnSelectors) {
+    const loc = (sel.startsWith('panel') ? panel : page).locator(sel.replace('panel ', '')).first();
+    const visible = await loc.isVisible().catch(() => false);
+    if (visible) {
+      searchBtn = loc;
+      console.log('[selectClient] found Search btn:', sel);
+      break;
+    }
   }
-  await page.waitForTimeout(400);
 
-  // Step 3: Click the Search button using evaluate
-  const searchClicked = await page.evaluate(() => {
-    // Try sbiz-search-client Search button
-    const btns = document.querySelectorAll('sbiz-search-client button, sbiz-book-right-panel button');
-    for (const btn of btns) {
-      if (btn.textContent.trim() === 'Search' || btn.innerText.trim() === 'Search') {
-        console.log('[selectClient] clicking Search button');
-        btn.click();
-        return true;
-      }
-    }
-    // Fallback: find any Search button in the panel
-    const allBtns = document.querySelectorAll('button');
-    for (const btn of allBtns) {
-      if (btn.offsetParent && btn.textContent.trim() === 'Search') {
-        btn.click();
-        return true;
-      }
-    }
-    return false;
-  });
-  console.log('[selectClient] searchClicked:', searchClicked);
-  await page.waitForTimeout(3000);
+  if (searchBtn) {
+    await searchBtn.click({ timeout: 10000 });
+    console.log('[selectClient] clicked Search button');
+  } else {
+    // Try Enter key as fallback
+    console.log('[selectClient] Search btn not found, pressing Enter');
+    await inlineInput.press('Enter');
+  }
 
-  // Step 4: Wait for and interact with the Client Search modal
-  // Poll for modal presence
-  let modalReady = false;
-  for (let attempt = 0; attempt < 8; attempt++) {
-    modalReady = await page.evaluate(() => {
-      const modal = document.querySelector('ngb-modal-window');
-      if (!modal) return false;
-      const rows = modal.querySelectorAll('table tbody tr');
-      return rows.length > 0;
-    });
-    if (modalReady) break;
-    console.log('[selectClient] waiting for modal rows, attempt', attempt + 1);
+  // Step 4: Wait for Client Search modal to appear
+  // Poll with up to 15 second timeout
+  console.log('[selectClient] waiting for modal...');
+  let modalRows = 0;
+  for (let i = 0; i < 10; i++) {
     await page.waitForTimeout(1500);
-  }
-
-  if (!modalReady) {
-    // Modal didn't open or has no rows - try pressing Enter instead of clicking Search
-    console.log('[selectClient] modal not ready, trying Enter key approach');
-    await page.evaluate(() => {
-      const inp = document.querySelector('sbiz-search-client input, sbiz-book-right-panel input');
-      if (inp) inp.focus();
+    modalRows = await page.evaluate(() => {
+      const m = document.querySelector('ngb-modal-window');
+      if (!m) return -1;
+      return m.querySelectorAll('table tbody tr').length;
     });
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(3000);
-    
-    // Check again
-    modalReady = await page.evaluate(() => {
-      const modal = document.querySelector('ngb-modal-window');
-      if (!modal) return false;
-      return modal.querySelectorAll('table tbody tr').length > 0;
-    });
-  }
-
-  if (!modalReady) {
-    throw new Error('Client not found: "' + nameStr + '" phone:' + phoneDigits + ' (modal did not open or no rows)');
-  }
-
-  // Step 5: Find the best row - prefer phone match, then name match
-  const rowInfo = await page.evaluate((phone, first, last) => {
-    const modal = document.querySelector('ngb-modal-window');
-    if (!modal) return null;
-    const rows = modal.querySelectorAll('table tbody tr');
-    const results = [];
-    rows.forEach((row, i) => {
-      const text = row.textContent || '';
-      const cells = row.querySelectorAll('td');
-      const cellTexts = Array.from(cells).map(c => c.textContent.trim());
-      results.push({ i, text: text.substring(0, 100), cells: cellTexts });
-    });
-    return results;
-  }, phoneDigits, firstName, lastName);
-
-  console.log('[selectClient] rows found:', JSON.stringify(rowInfo));
-
-  if (!rowInfo || rowInfo.length === 0) {
-    throw new Error('Client not found: "' + nameStr + '" phone:' + phoneDigits);
-  }
-
-  // Pick the best row (first phone match, or first name match, or first row)
-  const bestIdx = await page.evaluate((rows, phone, first, last) => {
-    // Try phone match first
-    for (const r of rows) {
-      if (r.text.replace(/\D/g, '').includes(phone)) return r.i;
+    console.log('[selectClient] modal check attempt', i+1, '- rows:', modalRows);
+    if (modalRows > 0) break;
+    if (modalRows === -1 && i >= 3) {
+      // Modal never appeared - try clicking Search again
+      if (searchBtn) {
+        console.log('[selectClient] re-clicking Search button');
+        await searchBtn.click({ timeout: 5000 }).catch(() => {});
+      } else {
+        await inlineInput.press('Enter').catch(() => {});
+      }
     }
-    // Try name match
-    const fullName = (first + ' ' + last).toLowerCase().trim();
-    for (const r of rows) {
-      if (r.text.toLowerCase().includes(first.toLowerCase()) && r.text.toLowerCase().includes(last.toLowerCase())) return r.i;
+  }
+
+  if (modalRows <= 0) {
+    // Take screenshot for debugging
+    await page.screenshot({ path: '/app/debug/select_client_no_modal.png' }).catch(() => {});
+    throw new Error('Client not found: "' + nameStr + '" phone:' + phoneDigits + ' - modal did not open (rows=' + modalRows + ')');
+  }
+
+  // Step 5: Get row info using page.evaluate
+  const rowData = await page.evaluate(() => {
+    const m = document.querySelector('ngb-modal-window');
+    if (!m) return [];
+    return Array.from(m.querySelectorAll('table tbody tr')).map((tr, i) => ({
+      i,
+      text: (tr.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 150)
+    }));
+  });
+
+  console.log('[selectClient] found', rowData.length, 'rows');
+  rowData.forEach(r => console.log('[selectClient] row', r.i, ':', r.text.substring(0, 80)));
+
+  // Pick best row
+  let bestIdx = 0;
+  for (const r of rowData) {
+    const digits = r.text.replace(/\D/g, '');
+    if (phoneDigits && digits.includes(phoneDigits)) {
+      bestIdx = r.i;
+      console.log('[selectClient] phone match at row', r.i);
+      break;
     }
-    // First row
-    return rows[0].i;
-  }, rowInfo, phoneDigits, firstName, lastName);
+  }
+  if (bestIdx === 0) {
+    for (const r of rowData) {
+      const t = r.text.toLowerCase();
+      if (firstName && t.includes(firstName.toLowerCase()) && lastName && t.includes(lastName.toLowerCase())) {
+        bestIdx = r.i;
+        console.log('[selectClient] name match at row', r.i);
+        break;
+      }
+    }
+  }
+  console.log('[selectClient] selecting row', bestIdx);
 
-  console.log('[selectClient] selecting row index:', bestIdx);
-
-  // Step 6: Click the best row using real mouse click via playwright
+  // Step 6: Click the row using multiple methods
   const modal = page.locator('ngb-modal-window').first();
-  const rows = modal.locator('table tbody tr');
-  const targetRow = rows.nth(bestIdx);
-  await targetRow.click({ timeout: 10000 });
+  const targetRow = modal.locator('table tbody tr').nth(bestIdx);
+  
+  // Try Playwright click first
+  try {
+    await targetRow.click({ timeout: 8000 });
+    console.log('[selectClient] row clicked via Playwright');
+  } catch (e) {
+    console.log('[selectClient] Playwright click failed, trying evaluate:', e.message);
+    await page.evaluate((idx) => {
+      const m = document.querySelector('ngb-modal-window');
+      const rows = m.querySelectorAll('table tbody tr');
+      const row = rows[idx];
+      if (row) {
+        row.dispatchEvent(new MouseEvent('mousedown', {bubbles:true}));
+        row.dispatchEvent(new MouseEvent('mouseup', {bubbles:true}));
+        row.click();
+      }
+    }, bestIdx);
+  }
   await page.waitForTimeout(800);
 
   // Step 7: Click the Select button
-  const selectClicked = await page.evaluate(() => {
-    const modal = document.querySelector('ngb-modal-window');
-    if (!modal) return false;
-    const btns = modal.querySelectorAll('button');
-    for (const btn of btns) {
-      if (btn.textContent.trim() === 'Select' || btn.innerText.trim() === 'Select') {
-        console.log('[selectClient] clicking Select button');
-        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-        btn.click();
-        return true;
+  const selectBtn = modal.locator('button:has-text("Select")').first();
+  try {
+    await selectBtn.click({ timeout: 8000 });
+    console.log('[selectClient] Select button clicked');
+  } catch (e) {
+    console.log('[selectClient] Select btn failed, trying evaluate:', e.message);
+    await page.evaluate(() => {
+      const m = document.querySelector('ngb-modal-window');
+      if (!m) return;
+      const btns = m.querySelectorAll('button');
+      for (const b of btns) {
+        if (b.textContent.trim() === 'Select') { b.click(); break; }
       }
-    }
-    return false;
-  });
-  console.log('[selectClient] selectClicked:', selectClicked);
+    });
+  }
   await page.waitForTimeout(1500);
 
   // Verify modal closed
-  const modalGone = await page.evaluate(() => !document.querySelector('ngb-modal-window'));
-  if (!modalGone) {
-    // Try clicking Select one more time with Playwright locator
-    try {
-      const selectBtn = page.locator('ngb-modal-window button:has-text("Select")').first();
-      await selectBtn.click({ timeout: 5000 });
-      await page.waitForTimeout(1500);
-    } catch (e) {
-      console.log('[selectClient] Select btn retry failed:', e.message);
-    }
+  const modalStillOpen = await page.evaluate(() => !!document.querySelector('ngb-modal-window'));
+  if (modalStillOpen) {
+    console.log('[selectClient] modal still open after Select - trying again');
+    await page.evaluate(() => {
+      const m = document.querySelector('ngb-modal-window');
+      if (!m) return;
+      const btns = m.querySelectorAll('button');
+      for (const b of btns) {
+        if (b.textContent.trim() === 'Select') { b.click(); return; }
+      }
+    });
+    await page.waitForTimeout(1500);
   }
-  console.log('[selectClient] client selected successfully');
+
+  console.log('[selectClient] DONE - client selected');
 }
 
 async function createNewClientInModal(page, { customerName, customerPhone, customerEmail }) {
