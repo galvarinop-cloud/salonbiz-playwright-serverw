@@ -1010,45 +1010,22 @@ app.post("/schedule", async (req, res) => {
   const args = extractArgs(req);
   const dateStr = args.date || args.startDate || todayStr();
 
-  try {
-    // Get the cached stylist list (excluding Denise)
-    const { stylists } = await getStylistsCached();
+  // Hardcoded active stylists — no Playwright needed, responds instantly
+  const ACTIVE_STYLISTS = ["Adria", "Breanna", "Daniela", "Katie", "Kendra", "Lyndsie"];
+  const defaultSchedule = ACTIVE_STYLISTS.map(name => ({
+    name,
+    isWorking: true,
+    notWorkingPeriods: []
+  }));
 
-    // Build schedule from stylist list — all available unless scrape shows otherwise
-    const defaultSchedule = stylists.map(name => ({
-      name,
-      isWorking: true,
-      notWorkingPeriods: []
-    }));
-
-    // Check apptCache for scraped appointment data (populated by background warmer)
-    const cached = apptCache.get(dateStr);
-    if (cached && Date.now() - cached.fetchedAt < APPT_CACHE_TTL_MS) {
-      console.log('[schedule] Serving from apptCache for', dateStr);
-      return vapiRespond(res, toolCallId, {
-        ok: true,
-        date: dateStr,
-        stylistCount: defaultSchedule.length,
-        schedule: defaultSchedule,
-        note: 'from-cache'
-      });
-    }
-
-    // Cache is cold — return immediately with default schedule and trigger background scrape
-    console.log('[schedule] Cache cold for', dateStr, '- returning default, warming in background');
-    setImmediate(() => warmApptCacheForDate(dateStr).catch(e => console.warn('[schedule] bg warm failed:', e.message)));
-
-    return vapiRespond(res, toolCallId, {
-      ok: true,
-      date: dateStr,
-      stylistCount: defaultSchedule.length,
-      schedule: defaultSchedule,
-      note: 'from-cache'
-    });
-  } catch (e) {
-    console.error("SCHEDULE error:", e);
-    return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
-  }
+  console.log('[schedule] Returning instant schedule for', dateStr);
+  return vapiRespond(res, toolCallId, {
+    ok: true,
+    date: dateStr,
+    stylistCount: defaultSchedule.length,
+    schedule: defaultSchedule,
+    note: 'from-cache'
+  });
 });
 
 app.post("/availability", async (req, res) => {
@@ -1276,70 +1253,44 @@ app.post("/find-openings", async (req, res) => {
   const args = extractArgs(req);
   const service = args.service || "";
   const minGapMinutes = 60; // All services require minimum 1 hour
-
-  // How many days forward to scan
   const daysToScan = 5;
 
   try {
-    const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-    const { context, page } = await getPage(browser);
-    await loginIfNeeded(page);
-    await saveCookies(context);
-
     const etNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
     const results = [];
 
-    for (let d = 1; d <= daysToScan && results.length < 3; d++) {
+    // Check how many days have warm cache
+    const datesNeeded = [];
+    for (let d = 1; d <= daysToScan; d++) {
       const scanDate = new Date(etNow);
       scanDate.setDate(etNow.getDate() + d);
-      const dateStr = formatYYYYMMDD(scanDate);
-      const dayName = scanDate.toLocaleDateString("en-US", { weekday: "long", timeZone: "America/New_York" });
+      datesNeeded.push({ dateStr: formatYYYYMMDD(scanDate), dayName: scanDate.toLocaleDateString("en-US", { weekday: "long", timeZone: "America/New_York" }) });
+    }
 
-      // Check apptCache first
-      let appointments = null;
+    // Check if all needed dates are warm
+    const allWarm = datesNeeded.every(({ dateStr }) => {
+      const c = apptCache.get(dateStr);
+      return c && Date.now() - c.fetchedAt < APPT_CACHE_TTL_MS;
+    });
+
+    if (!allWarm) {
+      // Trigger background warm (non-blocking) and use whatever is cached right now
+      console.log('[find-openings] Cache not fully warm, triggering background warm');
+      warmApptCacheForNextDays(daysToScan).catch(e => console.warn('[find-openings] bg warm failed:', e.message));
+    }
+
+    // Process whatever is in cache (or zeros if cold)
+    for (const { dateStr, dayName } of datesNeeded) {
+      if (results.length >= 3) break;
       const cached = apptCache.get(dateStr);
-      if (cached && Date.now() - cached.fetchedAt < APPT_CACHE_TTL_MS) {
-        appointments = cached.appointments;
-        console.log('[find-openings] Using cached data for', dateStr, '-', appointments.length, 'appointments');
-      } else {
-        // Scrape fresh for this date
-        try {
-          await navigateToDate(page, dateStr);
-          await page.waitForTimeout(1500); // Reduced from 3000ms
-          appointments = await page.evaluate(() => {
-            const appts = [];
-            const events = document.querySelectorAll(
-              ".dhx_cal_event, .dhx_event_move, [class*='cal_event'], sbiz-appointment-block, [class*='appointment']"
-            );
-            for (const ev of events) {
-              const combined = (ev.getAttribute("aria-label") || "") + " " + (ev.textContent || "");
-              const timePattern = /(\d{1,2}):(\d{2})\s*(AM|PM)/gi;
-              const times = [];
-              let match;
-              while ((match = timePattern.exec(combined)) !== null) {
-                let h = parseInt(match[1], 10);
-                const m = parseInt(match[2], 10);
-                const ampm = match[3].toUpperCase();
-                if (ampm === "PM" && h !== 12) h += 12;
-                if (ampm === "AM" && h === 12) h = 0;
-                times.push(h * 60 + m);
-              }
-              if (times.length >= 2) {
-                appts.push({ startMin: times[0], endMin: times[times.length - 1] });
-              } else if (times.length === 1) {
-                appts.push({ startMin: times[0], endMin: times[0] + 60 });
-              }
-            }
-            return appts;
-          });
-          // Store in cache
-          apptCache.set(dateStr, { appointments, fetchedAt: Date.now() });
-          console.log('[find-openings] Scraped', dateStr, '-', appointments.length, 'appointments');
-        } catch (e) {
-          console.warn('[find-openings] Scrape failed for', dateStr, ':', e.message);
-          appointments = [];
-        }
+      const appointments = (cached && Date.now() - cached.fetchedAt < APPT_CACHE_TTL_MS) ? cached.appointments : [];
+
+      if (!cached) {
+        console.log('[find-openings] No cache for', dateStr, '- skipping');
+        continue;
       }
+
+      console.log('[find-openings]', dateStr, '- using', appointments.length, 'cached appointments');
 
       // Find free slots with minGapMinutes of continuous free time
       const openStart = 9 * 60;  // 9 AM
@@ -1355,7 +1306,6 @@ app.post("/find-openings", async (req, res) => {
       }
 
       console.log('[find-openings]', dateStr, '- free slots:', freeSlots.slice(0, 4).join(', '));
-
       if (freeSlots.length > 0) {
         results.push({ date: dateStr, dayName, slots: freeSlots.slice(0, 4), appointmentCount: appointments.length });
       }
@@ -1398,56 +1348,68 @@ app.get("/debug/new_client_missing_lastname.png", (req, res) => res.sendFile("/t
 app.get("/debug/client_search_failed.png", (req, res) => res.sendFile("/tmp/client_search_failed.png"));
 app.get("/debug/new_client_before_create.png", (req, res) => res.sendFile("/tmp/new_client_before_create.png"));
 
-// ── Background appointment cache warmer ──────────────────────────
-async function warmApptCacheForDate(dateStr) {
-  try {
-    const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-    const { context, page } = await getPage(browser);
-    await loginIfNeeded(page);
-    await navigateToDate(page, dateStr);
-    await page.waitForTimeout(1500);
-    const appointments = await page.evaluate(() => {
-      const appts = [];
-      const events = document.querySelectorAll(
-        ".dhx_cal_event, .dhx_event_move, [class*='cal_event'], sbiz-appointment-block, [class*='appointment']"
-      );
-      for (const ev of events) {
-        const combined = (ev.getAttribute("aria-label") || "") + " " + (ev.textContent || "");
-        const timePattern = /(\d{1,2}):(\d{2})\s*(AM|PM)/gi;
-        const times = [];
-        let match;
-        while ((match = timePattern.exec(combined)) !== null) {
-          let h = parseInt(match[1], 10);
-          const m = parseInt(match[2], 10);
-          const ampm = match[3].toUpperCase();
-          if (ampm === "PM" && h !== 12) h += 12;
-          if (ampm === "AM" && h === 12) h = 0;
-          times.push(h * 60 + m);
-        }
-        if (times.length >= 2) {
-          appts.push({ startMin: times[0], endMin: times[times.length - 1] });
-        } else if (times.length === 1) {
-          appts.push({ startMin: times[0], endMin: times[0] + 60 });
-        }
-      }
-      return appts;
-    });
-    apptCache.set(dateStr, { appointments, fetchedAt: Date.now() });
-    console.log('[warmApptCache]', dateStr, '-', appointments.length, 'appointments cached');
-  } catch (e) {
-    console.warn('[warmApptCache] Failed for', dateStr, ':', e.message);
-  }
-}
+// ── Background appointment cache warmer (single browser, sequential) ──
+let _warmLock = false; // prevent concurrent warm runs
 
 async function warmApptCacheForNextDays(numDays = 5) {
-  const etNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
-  for (let d = 0; d <= numDays; d++) {
-    const scanDate = new Date(etNow);
-    scanDate.setDate(etNow.getDate() + d);
-    const dateStr = formatYYYYMMDD(scanDate);
-    await warmApptCacheForDate(dateStr);
+  if (_warmLock) {
+    console.log('[warmApptCache] Already running, skipping');
+    return;
   }
-  console.log('[warmApptCache] Finished warming', numDays+1, 'days');
+  _warmLock = true;
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+    const { page } = await getPage(browser);
+    await loginIfNeeded(page);
+
+    const etNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+    for (let d = 0; d <= numDays; d++) {
+      const scanDate = new Date(etNow);
+      scanDate.setDate(etNow.getDate() + d);
+      const dateStr = formatYYYYMMDD(scanDate);
+      try {
+        await navigateToDate(page, dateStr);
+        await page.waitForTimeout(1500);
+        const appointments = await page.evaluate(() => {
+          const appts = [];
+          const events = document.querySelectorAll(
+            ".dhx_cal_event, .dhx_event_move, [class*='cal_event'], sbiz-appointment-block, [class*='appointment']"
+          );
+          for (const ev of events) {
+            const combined = (ev.getAttribute("aria-label") || "") + " " + (ev.textContent || "");
+            const timePattern = /(\d{1,2}):(\d{2})\s*(AM|PM)/gi;
+            const times = [];
+            let match;
+            while ((match = timePattern.exec(combined)) !== null) {
+              let h = parseInt(match[1], 10);
+              const m = parseInt(match[2], 10);
+              const ampm = match[3].toUpperCase();
+              if (ampm === "PM" && h !== 12) h += 12;
+              if (ampm === "AM" && h === 12) h = 0;
+              times.push(h * 60 + m);
+            }
+            if (times.length >= 2) {
+              appts.push({ startMin: times[0], endMin: times[times.length - 1] });
+            } else if (times.length === 1) {
+              appts.push({ startMin: times[0], endMin: times[0] + 60 });
+            }
+          }
+          return appts;
+        });
+        apptCache.set(dateStr, { appointments, fetchedAt: Date.now() });
+        console.log('[warmApptCache]', dateStr, '-', appointments.length, 'appointments cached');
+      } catch (e) {
+        console.warn('[warmApptCache] Failed for', dateStr, ':', e.message);
+      }
+    }
+    console.log('[warmApptCache] Finished warming', numDays + 1, 'days');
+  } catch (e) {
+    console.warn('[warmApptCache] Browser launch failed:', e.message);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    _warmLock = false;
+  }
 }
 
 app.listen(PORT, () => {
