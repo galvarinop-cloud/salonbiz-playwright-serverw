@@ -823,6 +823,16 @@ async function selectExistingClient(page, nameStr, phoneStr) {
     console.log('[selectClient] firstName-only rows:', rowCount);
   }
 
+  // ── Step 4b: Absolute last resort — phone only (ignores name entirely) ─
+  if (rowCount <= 0 && phoneDigits && phoneDigits.length >= 7) {
+    console.log('[selectClient] absolute last resort - phone ONLY:', phoneDigits);
+    await fillField('firstName', '');
+    await fillField('lastName', '');
+    await fillField('contact', phoneDigits);
+    rowCount = await doSearch();
+    console.log('[selectClient] phone-only rows:', rowCount);
+  }
+
   if (rowCount <= 0) {
     await page.screenshot({ path: '/app/debug/select_client_no_rows.png' }).catch(() => {});
     throw new Error('Client not found: "' + nameStr + '" phone:' + phoneDigits + ' (rows=0)');
