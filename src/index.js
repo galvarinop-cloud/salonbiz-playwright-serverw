@@ -681,6 +681,8 @@ async function selectExistingClient(page, nameStr, phoneStr) {
   const panel = page.locator("sbiz-book-right-panel");
   const { firstName, lastName } = splitName(nameStr);
   const phoneDigits = digitsOnly(phoneStr || '').slice(-10);
+
+  // Step 1: Type in inline search and click to open Client Search modal
   const inlineInput = panel.locator('input[placeholder="Search by name or contact"]').first();
   await inlineInput.waitFor({ state: "visible", timeout: 15000 });
   await inlineInput.click(); await inlineInput.fill("");
@@ -688,79 +690,126 @@ async function selectExistingClient(page, nameStr, phoneStr) {
   await page.waitForTimeout(300);
   const inlineSearchBtn = panel.locator('sbiz-search-client button:has-text("Search")').first();
   await inlineSearchBtn.click({ timeout: 10000 });
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2000);
+
+  // Step 2: Wait for Client Search modal
   const modal = page.locator("ngb-modal-window").first();
   await modal.waitFor({ state: "visible", timeout: 12000 });
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(1000);
+
   const modalSearchBtn = modal.locator('button:has-text("Search")').first();
   const fnField = modal.locator('input[formcontrolname="firstName"]').first();
   const lnField = modal.locator('input[formcontrolname="lastName"]').first();
   const ctField = modal.locator('input[formcontrolname="contact"]').first();
+
   const setF = async (loc, val) => {
-    if (!(await loc.isVisible().catch(()=>false))) return;
-    await loc.evaluate((el,v)=>{const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;s.call(el,v);el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));},String(val));
+    await loc.click().catch(()=>{});
+    await loc.evaluate((el, v) => {
+      el.value = v;
+      el.dispatchEvent(new Event('input', {bubbles:true}));
+      el.dispatchEvent(new Event('change', {bubbles:true}));
+    }, val);
     await page.waitForTimeout(80);
   };
+
+  // Step 3: Search by phone
   if (phoneDigits.length >= 7) {
     await setF(fnField,''); await setF(lnField,''); await setF(ctField, phoneDigits);
-    if (await ctField.isVisible().catch(()=>false)) { await ctField.click({clickCount:3}); await ctField.type(phoneDigits,{delay:20}); }
     await page.waitForTimeout(200);
-    await modalSearchBtn.click({timeout:10000}); await page.waitForTimeout(3000);
+    await modalSearchBtn.click({timeout:10000});
+    await page.waitForTimeout(4000);
   }
-  const rows = modal.locator("table tbody tr");
-  let rowCount = await rows.count().catch(()=>0);
+
+  // Count rows using page.evaluate to bypass Angular selector issues
+  let rowCount = await page.evaluate(() => {
+    const m = document.querySelector('ngb-modal-window');
+    if (!m) return 0;
+    return m.querySelectorAll('table tbody tr').length;
+  }).catch(() => 0);
   console.log("[selectClient] Phone rows:", rowCount);
+
   if (rowCount === 0) {
-    await setF(fnField,firstName); await setF(lnField,lastName); await setF(ctField,'');
-    if (await fnField.isVisible().catch(()=>false)) { await fnField.click({clickCount:3}); await fnField.type(firstName,{delay:20}); }
-    if (await lnField.isVisible().catch(()=>false)) { await lnField.click({clickCount:3}); await lnField.type(lastName,{delay:20}); }
+    // Try by name
+    await setF(fnField, firstName); await setF(lnField, lastName); await setF(ctField, '');
     await page.waitForTimeout(200);
-    await modalSearchBtn.click({timeout:10000}); await page.waitForTimeout(3000);
-    rowCount = await rows.count().catch(()=>0);
+    await modalSearchBtn.click({timeout:10000});
+    await page.waitForTimeout(4000);
+    rowCount = await page.evaluate(() => {
+      const m = document.querySelector('ngb-modal-window');
+      if (!m) return 0;
+      return m.querySelectorAll('table tbody tr').length;
+    }).catch(() => 0);
     console.log("[selectClient] Name rows:", rowCount);
   }
+
   if (rowCount === 0) {
-    await page.screenshot({path:"/tmp/client_search_failed.png",fullPage:true}).catch(()=>{});
-    await modal.locator('button:has-text("Close"),button[aria-label="Close"]').first().evaluate(el=>el.click()).catch(()=>page.keyboard.press("Escape"));
+    await modal.locator('button:has-text("Close"),button[aria-label="Close"]').first().evaluate(el=>el.click()).catch(()=>page.keyboard.press('Escape'));
     await page.waitForTimeout(500);
     throw new Error('Client not found: "'+nameStr+'" phone:'+phoneStr);
   }
+
+  // Step 4: Pick best row (prefer phone match)
   let bestRow = 0;
   if (phoneDigits.length >= 7) {
-    const sp = phoneDigits.slice(-7);
-    for (let i=0;i<rowCount;i++){const t=await rows.nth(i).innerText().catch(()=>"");if(digitsOnly(t).includes(sp)){bestRow=i;break;}}
+    const rowTexts = await page.evaluate(() => {
+      const m = document.querySelector('ngb-modal-window');
+      if (!m) return [];
+      return Array.from(m.querySelectorAll('table tbody tr')).map(r => r.textContent || '');
+    }).catch(() => []);
+    for (let i = 0; i < rowTexts.length; i++) {
+      if (digitsOnly(rowTexts[i]).includes(phoneDigits)) { bestRow = i; break; }
+    }
   }
   console.log("[selectClient] Clicking row", bestRow, "of", rowCount);
-  await page.screenshot({path:"/tmp/client_search_failed.png",fullPage:true}).catch(()=>{});
-  const rowEl = rows.nth(bestRow);
-  await rowEl.scrollIntoViewIfNeeded().catch(()=>{});
-  await page.waitForTimeout(300);
-  // Use real Playwright click (moves mouse, fires all events Angular needs)
-  await rowEl.click({timeout:8000});
+
+  // Step 5: Click row and Select button using evaluate (most reliable for Angular)
+  await page.evaluate((rowIdx) => {
+    const m = document.querySelector('ngb-modal-window');
+    if (!m) return;
+    const rows = m.querySelectorAll('table tbody tr');
+    if (rows[rowIdx]) {
+      rows[rowIdx].click();
+      rows[rowIdx].dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+    }
+  }, bestRow);
   await page.waitForTimeout(1000);
+
+  // Click Select button
   const selBtn = modal.locator('button:has-text("Select")').last();
   if (await selBtn.isVisible().catch(()=>false)) {
-    await selBtn.click({timeout:8000}); console.log("[selectClient] Select clicked");
+    await selBtn.click({timeout:8000});
+    console.log("[selectClient] Select clicked");
   } else {
-    await rowEl.dblclick({timeout:5000}).catch(()=>{});
+    await page.evaluate(() => {
+      const m = document.querySelector('ngb-modal-window');
+      if (!m) return;
+      const btns = Array.from(m.querySelectorAll('button'));
+      const sel = btns.find(b => b.textContent.trim() === 'Select');
+      if (sel) sel.click();
+    });
     await page.waitForTimeout(800);
-    const sb2 = modal.locator('button:has-text("Select")').last();
-    if (await sb2.isVisible().catch(()=>false)) { await sb2.click({timeout:5000}); console.log("[selectClient] Select after dblclick"); }
-    else { await modal.locator('button:has-text("Select")').last().click({timeout:3000,force:true}).catch(()=>{}); console.log("[selectClient] Force-clicked Select"); }
   }
-  const closed = await modal.waitFor({state:"hidden",timeout:15000}).then(()=>true).catch(()=>false);
+
+  // Step 6: Verify modal closed
+  await page.waitForTimeout(1500);
+  const closed = !(await modal.isVisible().catch(()=>true));
   if (!closed) {
-    console.warn("[selectClient] Modal still open, retry Select");
-    await modal.locator('button:has-text("Select")').last().click({timeout:3000,force:true}).catch(()=>{});
+    console.warn("[selectClient] Modal still open, retrying Select");
+    await page.evaluate(() => {
+      const m = document.querySelector('ngb-modal-window');
+      if (!m) return;
+      const btns = Array.from(m.querySelectorAll('button'));
+      const sel = btns.find(b => b.textContent.trim() === 'Select');
+      if (sel) sel.click();
+    });
     await page.waitForTimeout(2000);
     if (await modal.isVisible().catch(()=>true)) {
-      await page.screenshot({path:"/tmp/client_search_failed.png",fullPage:true}).catch(()=>{});
       throw new Error('Could not select client — Select button did not close modal');
     }
   }
-  await page.waitForTimeout(600);
-  console.log("[selectClient] Complete");
+  console.log("[selectClient] Client selected successfully");
 }
+
 async function createNewClientInModal(page, { customerName, customerPhone, customerEmail }) {
   const modal = page.locator("ngb-modal-window").first();
   await modal.waitFor({state:"visible",timeout:20000});
