@@ -1281,7 +1281,8 @@ app.post("/find-openings", async (req, res) => {
   const daysToScan = 5;
 
   try {
-    const { context, page } = await getBrowserSession();
+    const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+    const { context, page } = await getPage(browser);
     await loginIfNeeded(page);
     await saveCookies(context);
 
@@ -1400,7 +1401,8 @@ app.get("/debug/new_client_before_create.png", (req, res) => res.sendFile("/tmp/
 // ── Background appointment cache warmer ──────────────────────────
 async function warmApptCacheForDate(dateStr) {
   try {
-    const { context, page } = await getBrowserSession();
+    const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+    const { context, page } = await getPage(browser);
     await loginIfNeeded(page);
     await navigateToDate(page, dateStr);
     await page.waitForTimeout(1500);
