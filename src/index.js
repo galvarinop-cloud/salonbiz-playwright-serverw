@@ -298,6 +298,30 @@ async function loginIfNeeded(page) {
   console.log("[login] Already on appointmentbook, session valid");
 }
 async function clickPinkCreateButton(page) {
+  // Dismiss any open dropdown first (e.g. location selector)
+  await page.evaluate(() => {
+    const dropdowns = document.querySelectorAll('.dropdown-menu.show, .dropdown.show');
+    dropdowns.forEach(d => {
+      const toggle = d.previousElementSibling || d.parentElement?.querySelector('[data-toggle="dropdown"]');
+      if (toggle) toggle.click();
+    });
+  });
+  await page.waitForTimeout(300);
+
+  // Try text-based locators first (most reliable)
+  const createBtns = [
+    page.locator('button:has-text("+ Create")').first(),
+    page.locator('button:has-text("Create")').last(),
+    page.locator('sbiz-appointment-book-header button.btn-primary').first(),
+  ];
+  for (const btn of createBtns) {
+    if (await btn.isVisible().catch(() => false)) {
+      await btn.click({ timeout: 5000 });
+      await page.waitForTimeout(1200);
+      return;
+    }
+  }
+  // Last resort: coordinate click
   const vp = page.viewportSize() || { width: 1280, height: 720 };
   await page.mouse.click(Math.floor(vp.width * CREATE_CLICK_X_PCT), Math.floor(vp.height * CREATE_CLICK_Y_PCT));
   await page.waitForTimeout(1200);
@@ -326,10 +350,32 @@ async function ensureCreatePanelOpen(page) {
   const si = panel.locator('input[formcontrolname="service"]').first();
   if (await si.isVisible().catch(() => false)) return si;
 
+  // Click Create button
   await clickPinkCreateButton(page);
   await page.waitForTimeout(1500);
   if (await si.isVisible().catch(() => false)) return si;
 
+  // Check if a location/salon dropdown appeared instead of the panel — dismiss it
+  const locationDropOpen = await page.evaluate(() => {
+    const menus = document.querySelectorAll('.dropdown-menu.show');
+    return menus.length > 0;
+  });
+  if (locationDropOpen) {
+    console.log('[ensurePanel] location dropdown appeared, dismissing');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(500);
+    // Now try clicking the actual Create button more precisely
+    await page.evaluate(() => {
+      // Find the pink/primary Create button in the header
+      const btns = Array.from(document.querySelectorAll('button'));
+      const createBtn = btns.find(b => b.textContent.trim().includes('Create') && (b.classList.contains('btn-primary') || b.closest('sbiz-appointment-book-header')));
+      if (createBtn) createBtn.click();
+    });
+    await page.waitForTimeout(1500);
+    if (await si.isVisible().catch(() => false)) return si;
+  }
+
+  // Try additional button selectors
   const createBtns = [
     page.locator('button:has-text("New Appointment")').first(),
     page.locator('button:has-text("Create Appointment")').first(),
