@@ -31,6 +31,8 @@ const SCHEDULE_CACHE_TTL_MS = Number(process.env.SCHEDULE_CACHE_TTL_MS || 5 * 60
 
 // How long to wait (ms) for the Playwright booking to finish before timing out
 const BOOK_TIMEOUT_MS = Number(process.env.BOOK_TIMEOUT_MS || 150000);
+const apptCache = new Map(); // key: dateStr, value: { appointments: [...], fetchedAt: Date.now() }
+const APPT_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
 
 function scheduleExpired(entry) {
   return !entry || Date.now() - entry.fetchedAt > SCHEDULE_CACHE_TTL_MS;
@@ -383,9 +385,9 @@ async function navigateToDate(page, dateStr) {
     cookieState = null;
     await loginIfNeeded(page);
     await page.goto(`${SALONBIZ_BASE_URL}/appointmentbook?date=${dateStr}`, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(1000);
   }
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(1000);
   if ((await readDisplayedDate(page)) === dateStr) return;
   const pickers = ['input[formcontrolname="date"]', 'input[type="date"]', ".sbiz-datepicker input", "sbiz-date-picker input"];
   for (const sel of pickers) {
@@ -396,7 +398,7 @@ async function navigateToDate(page, dateStr) {
     await page.keyboard.press("Control+a");
     await page.keyboard.type(dateStr, { delay: 30 });
     await page.keyboard.press("Enter");
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(1000);
     if ((await readDisplayedDate(page)) === dateStr) return;
     break;
   }
@@ -1011,40 +1013,44 @@ app.post("/schedule", async (req, res) => {
   try {
     // Get the cached stylist list (excluding Denise)
     const { stylists } = await getStylistsCached();
-    
-    // Build a simple schedule: all non-Denise stylists are assumed working
-    // Real blocking is detected at booking time via SalonBiz's own validation
-    const schedule = stylists.map(name => ({
+
+    // Build schedule from stylist list — all available unless scrape shows otherwise
+    const defaultSchedule = stylists.map(name => ({
       name,
       isWorking: true,
       notWorkingPeriods: []
     }));
 
-    // Try actual schedule scrape but don't fail if it returns empty
-    let scrapedSchedule = [];
-    try {
-      const { schedule: scraped } = await getScheduleCached(dateStr);
-      if (scraped && scraped.length > 0) {
-        scrapedSchedule = scraped;
-      }
-    } catch (e) {
-      console.warn('[schedule] Scrape failed, using stylist cache:', e.message);
+    // Check apptCache for scraped appointment data (populated by background warmer)
+    const cached = apptCache.get(dateStr);
+    if (cached && Date.now() - cached.fetchedAt < APPT_CACHE_TTL_MS) {
+      console.log('[schedule] Serving from apptCache for', dateStr);
+      return vapiRespond(res, toolCallId, {
+        ok: true,
+        date: dateStr,
+        stylistCount: defaultSchedule.length,
+        schedule: defaultSchedule,
+        note: 'from-cache'
+      });
     }
 
-    const finalSchedule = scrapedSchedule.length > 0 ? scrapedSchedule : schedule;
+    // Cache is cold — return immediately with default schedule and trigger background scrape
+    console.log('[schedule] Cache cold for', dateStr, '- returning default, warming in background');
+    setImmediate(() => warmApptCacheForDate(dateStr).catch(e => console.warn('[schedule] bg warm failed:', e.message)));
 
     return vapiRespond(res, toolCallId, {
       ok: true,
       date: dateStr,
-      stylistCount: finalSchedule.length,
-      schedule: finalSchedule,
-      note: scrapedSchedule.length > 0 ? 'scraped' : 'from-cache'
+      stylistCount: defaultSchedule.length,
+      schedule: defaultSchedule,
+      note: 'from-cache'
     });
   } catch (e) {
     console.error("SCHEDULE error:", e);
     return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
   }
 });
+
 app.post("/availability", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
@@ -1268,160 +1274,91 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
 app.post("/find-openings", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   const args = extractArgs(req);
-  const service = args.service || "Haircut";
-  const startHour = Number(args.startHour || 9);
-  const endHour = Number(args.endHour || 18);
-  const daysToScan = Math.min(Number(args.daysToScan || 7), 14);
-  const maxResults = Number(args.maxResults || 3);
-  const minGapMinutes = Number(args.minGapMinutes || 60);
-  const slotIntervalMinutes = 30;
+  const service = args.service || "";
+  const minGapMinutes = 60; // All services require minimum 1 hour
 
-  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-  const { context, page } = await getPage(browser);
+  // How many days forward to scan
+  const daysToScan = 5;
 
   try {
-    if (cookiesExpired()) cookieState = null;
+    const { context, page } = await getBrowserSession();
     await loginIfNeeded(page);
     await saveCookies(context);
 
-    const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const etNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
     const results = [];
 
-    for (let d = 1; d <= daysToScan + 7 && results.length < maxResults; d++) {
+    for (let d = 1; d <= daysToScan && results.length < 3; d++) {
       const scanDate = new Date(etNow);
       scanDate.setDate(etNow.getDate() + d);
-      const dayOfWeek = scanDate.getDay();
-      if (dayOfWeek === 0) continue; // Skip Sunday
-
       const dateStr = formatYYYYMMDD(scanDate);
-      const dayName = scanDate.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
+      const dayName = scanDate.toLocaleDateString("en-US", { weekday: "long", timeZone: "America/New_York" });
 
-      try {
-        await navigateToDate(page, dateStr);
-        await page.waitForTimeout(3000); // Wait for calendar to fully render
-      } catch (e) {
-        console.warn('[find-openings] navigateToDate failed for', dateStr, ':', e.message);
-        continue;
+      // Check apptCache first
+      let appointments = null;
+      const cached = apptCache.get(dateStr);
+      if (cached && Date.now() - cached.fetchedAt < APPT_CACHE_TTL_MS) {
+        appointments = cached.appointments;
+        console.log('[find-openings] Using cached data for', dateStr, '-', appointments.length, 'appointments');
+      } else {
+        // Scrape fresh for this date
+        try {
+          await navigateToDate(page, dateStr);
+          await page.waitForTimeout(1500); // Reduced from 3000ms
+          appointments = await page.evaluate(() => {
+            const appts = [];
+            const events = document.querySelectorAll(
+              ".dhx_cal_event, .dhx_event_move, [class*='cal_event'], sbiz-appointment-block, [class*='appointment']"
+            );
+            for (const ev of events) {
+              const combined = (ev.getAttribute("aria-label") || "") + " " + (ev.textContent || "");
+              const timePattern = /(\d{1,2}):(\d{2})\s*(AM|PM)/gi;
+              const times = [];
+              let match;
+              while ((match = timePattern.exec(combined)) !== null) {
+                let h = parseInt(match[1], 10);
+                const m = parseInt(match[2], 10);
+                const ampm = match[3].toUpperCase();
+                if (ampm === "PM" && h !== 12) h += 12;
+                if (ampm === "AM" && h === 12) h = 0;
+                times.push(h * 60 + m);
+              }
+              if (times.length >= 2) {
+                appts.push({ startMin: times[0], endMin: times[times.length - 1] });
+              } else if (times.length === 1) {
+                appts.push({ startMin: times[0], endMin: times[0] + 60 });
+              }
+            }
+            return appts;
+          });
+          // Store in cache
+          apptCache.set(dateStr, { appointments, fetchedAt: Date.now() });
+          console.log('[find-openings] Scraped', dateStr, '-', appointments.length, 'appointments');
+        } catch (e) {
+          console.warn('[find-openings] Scrape failed for', dateStr, ':', e.message);
+          appointments = [];
+        }
       }
 
-      // Scrape appointments by reading text content from event blocks
-      // Each appointment block has time info in aria-label or inner text
-      const appointments = await page.evaluate(() => {
-        const appts = [];
-        
-        // Method 1: Try aria-label on event containers (most reliable)
-        const events = document.querySelectorAll('[class*="dhx_cal_event"], [class*="appointment"], [class*="event-block"]');
-        for (const ev of events) {
-          const label = ev.getAttribute('aria-label') || '';
-          const text = ev.textContent || '';
-          const combined = label + ' ' + text;
-          
-          // Look for time patterns like "9:00 AM", "10:30 AM", "2:00 PM" in the text
-          const timePattern = /\b(\d{1,2}):(\d{2})\s*(AM|PM)\b/gi;
-          const times = [];
-          let match;
-          while ((match = timePattern.exec(combined)) !== null) {
-            let h = parseInt(match[1]);
-            const m = parseInt(match[2]);
-            const ampm = match[3].toUpperCase();
-            if (ampm === 'AM' && h === 12) h = 0;
-            if (ampm === 'PM' && h !== 12) h += 12;
-            times.push(h * 60 + m);
-          }
-          
-          if (times.length >= 2) {
-            times.sort((a, b) => a - b);
-            appts.push({ startMin: times[0], endMin: times[times.length - 1] });
-          } else if (times.length === 1) {
-            // Single time found, assume at least 30 min duration
-            appts.push({ startMin: times[0], endMin: times[0] + 30 });
-          }
-        }
-        
-        // Method 2: Use pixel position as fallback if we got nothing
-        if (appts.length === 0) {
-          // DHtmlX calendar: find event blocks with style="top:Xpx; height:Ypx"
-          // Calendar starts at 7:00 AM. Pixel scale: look at time ruler
-          const ruler = document.querySelector('.dhx_cal_scale_placeholder, [class*="time_ruler"], [class*="time-ruler"]');
-          let pxPerHour = 40; // default estimate
-          
-          // Try to measure actual px per hour from time labels
-          const timeLabels = document.querySelectorAll('.dhx_scale_hour, [class*="hour_label"], [class*="time-label"]');
-          const labelData = [];
-          for (const lbl of timeLabels) {
-            const text = lbl.textContent.trim();
-            const match = text.match(/^(\d{1,2}):?(\d{0,2})\s*(AM|PM)?$/i);
-            if (!match) continue;
-            let h = parseInt(match[1]);
-            if (match[3] && match[3].toUpperCase() === 'PM' && h !== 12) h += 12;
-            if (match[3] && match[3].toUpperCase() === 'AM' && h === 12) h = 0;
-            const bb = lbl.getBoundingClientRect();
-            if (bb.height > 0) labelData.push({ hour: h, y: bb.top });
-          }
-          
-          if (labelData.length >= 2) {
-            labelData.sort((a, b) => a.y - b.y);
-            const dy = labelData[1].y - labelData[0].y;
-            const dh = labelData[1].hour - labelData[0].hour;
-            if (dy > 0 && dh > 0) pxPerHour = dy / dh;
-          }
-          
-          const firstLabelY = labelData.length > 0 ? labelData[0].y : 0;
-          const firstLabelHour = labelData.length > 0 ? labelData[0].hour : 7;
-          
-          const eventBlocks = document.querySelectorAll('[class*="dhx_cal_event"][style*="top"]');
-          for (const ev of eventBlocks) {
-            const container = ev.querySelector('[class*="appointment-block"], [class*="event-content"]');
-            if (!container && !ev.textContent.trim()) continue;
-            
-            const style = ev.getAttribute('style') || '';
-            const topMatch = style.match(/top:\s*(\d+(?:\.\d+)?)px/);
-            const heightMatch = style.match(/height:\s*(\d+(?:\.\d+)?)px/);
-            if (!topMatch || !heightMatch) continue;
-            
-            const topPx = parseFloat(topMatch[1]);
-            const heightPx = parseFloat(heightMatch[1]);
-            const bb = ev.getBoundingClientRect();
-            
-            // Convert using measured scale
-            const startMin = Math.round(firstLabelHour * 60 + (bb.top - firstLabelY) / pxPerHour * 60);
-            const durationMin = Math.max(30, Math.round(heightPx / pxPerHour * 60));
-            
-            if (startMin >= 0 && startMin < 24 * 60) {
-              appts.push({ startMin, endMin: startMin + durationMin });
-            }
-          }
-        }
-        
-        return appts;
-      });
-
-      console.log('[find-openings]', dateStr, '- scraped', appointments.length, 'appointments', JSON.stringify(appointments.map(a => ({s: a.startMin, e: a.endMin}))));
-      appointments.sort((a, b) => a.startMin - b.startMin);
-
-      // Find free slots with at least minGapMinutes of continuous free time
-      const businessStartMin = startHour * 60;
-      const businessEndMin = endHour * 60;
-
+      // Find free slots with minGapMinutes of continuous free time
+      const openStart = 9 * 60;  // 9 AM
+      const openEnd = 18 * 60;   // 6 PM
+      const step = 30;
       const freeSlots = [];
-      for (let slotMin = businessStartMin; slotMin + minGapMinutes <= businessEndMin; slotMin += slotIntervalMinutes) {
+      for (let slotMin = openStart; slotMin <= openEnd - minGapMinutes; slotMin += step) {
         const slotEnd = slotMin + minGapMinutes;
-        // A slot is free if no appointment overlaps with [slotMin, slotEnd)
-        const isBusy = appointments.some(a => slotMin < a.endMin && slotEnd > a.startMin);
+        const isBusy = appointments.some(a => a.startMin < slotEnd && a.endMin > slotMin);
         if (!isBusy) {
           freeSlots.push(spokenTime(minutesToTimeStr(slotMin)));
         }
       }
 
-      console.log('[find-openings]', dateStr, '- free slots (with', minGapMinutes, 'min gap):', freeSlots.slice(0, 4).join(', '));
+      console.log('[find-openings]', dateStr, '- free slots:', freeSlots.slice(0, 4).join(', '));
 
       if (freeSlots.length > 0) {
         results.push({ date: dateStr, dayName, slots: freeSlots.slice(0, 4), appointmentCount: appointments.length });
       }
     }
-
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
 
     return vapiRespond(res, toolCallId, {
       ok: true,
@@ -1432,12 +1369,10 @@ app.post("/find-openings", async (req, res) => {
     });
   } catch (e) {
     console.error("FIND-OPENINGS error:", e);
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
     return vapiRespond(res, toolCallId, { ok: false, error: e?.message || String(e) }, 500);
   }
 });
-// ── Legacy /book/status route (kept for compatibility) ─────────
+
 app.post("/book/status", async (req, res) => {
   const toolCallId = extractToolCallId(req);
   // With the new synchronous /book endpoint, polling is no longer needed.
@@ -1462,12 +1397,73 @@ app.get("/debug/new_client_missing_lastname.png", (req, res) => res.sendFile("/t
 app.get("/debug/client_search_failed.png", (req, res) => res.sendFile("/tmp/client_search_failed.png"));
 app.get("/debug/new_client_before_create.png", (req, res) => res.sendFile("/tmp/new_client_before_create.png"));
 
+// ── Background appointment cache warmer ──────────────────────────
+async function warmApptCacheForDate(dateStr) {
+  try {
+    const { context, page } = await getBrowserSession();
+    await loginIfNeeded(page);
+    await navigateToDate(page, dateStr);
+    await page.waitForTimeout(1500);
+    const appointments = await page.evaluate(() => {
+      const appts = [];
+      const events = document.querySelectorAll(
+        ".dhx_cal_event, .dhx_event_move, [class*='cal_event'], sbiz-appointment-block, [class*='appointment']"
+      );
+      for (const ev of events) {
+        const combined = (ev.getAttribute("aria-label") || "") + " " + (ev.textContent || "");
+        const timePattern = /(\d{1,2}):(\d{2})\s*(AM|PM)/gi;
+        const times = [];
+        let match;
+        while ((match = timePattern.exec(combined)) !== null) {
+          let h = parseInt(match[1], 10);
+          const m = parseInt(match[2], 10);
+          const ampm = match[3].toUpperCase();
+          if (ampm === "PM" && h !== 12) h += 12;
+          if (ampm === "AM" && h === 12) h = 0;
+          times.push(h * 60 + m);
+        }
+        if (times.length >= 2) {
+          appts.push({ startMin: times[0], endMin: times[times.length - 1] });
+        } else if (times.length === 1) {
+          appts.push({ startMin: times[0], endMin: times[0] + 60 });
+        }
+      }
+      return appts;
+    });
+    apptCache.set(dateStr, { appointments, fetchedAt: Date.now() });
+    console.log('[warmApptCache]', dateStr, '-', appointments.length, 'appointments cached');
+  } catch (e) {
+    console.warn('[warmApptCache] Failed for', dateStr, ':', e.message);
+  }
+}
+
+async function warmApptCacheForNextDays(numDays = 5) {
+  const etNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  for (let d = 0; d <= numDays; d++) {
+    const scanDate = new Date(etNow);
+    scanDate.setDate(etNow.getDate() + d);
+    const dateStr = formatYYYYMMDD(scanDate);
+    await warmApptCacheForDate(dateStr);
+  }
+  console.log('[warmApptCache] Finished warming', numDays+1, 'days');
+}
+
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
+  // Warm stylist cache after 2s
   setTimeout(() => {
     getStylistsCached()
       .then(({ cached }) => console.log(`Stylist cache warmed (cached=${cached})`))
       .catch(e => console.warn("Stylist cache warmup failed:", e?.message || e));
   }, 2000);
-  setInterval(() => { getStylistsCached().catch(() => {}); }, STYLIST_CACHE_TTL_MS);
+  // Warm appointment cache after 5s, then every 3 minutes
+  setTimeout(() => {
+    warmApptCacheForNextDays(5)
+      .catch(e => console.warn("[startup] appt cache warm failed:", e?.message));
+  }, 5000);
+  setInterval(() => {
+    warmApptCacheForNextDays(5)
+      .catch(e => console.warn("[interval] appt cache warm failed:", e?.message));
+  }, 3 * 60 * 1000); // every 3 minutes
+}); }, STYLIST_CACHE_TTL_MS);
 });
