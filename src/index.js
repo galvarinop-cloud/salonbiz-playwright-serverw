@@ -34,6 +34,42 @@ const BOOK_TIMEOUT_MS = Number(process.env.BOOK_TIMEOUT_MS || 150000);
 const apptCache = new Map(); // key: dateStr, value: { appointments: [...], fetchedAt: Date.now() }
 const APPT_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
 
+// Salon operating hours - day of week (0=Sun, 1=Mon, ..., 6=Sat)
+const SALON_HOURS = {
+  0: null,                        // Sunday - CLOSED
+  1: null,                        // Monday - CLOSED
+  2: { open: 11 * 60, close: 18 * 60 },  // Tuesday 11am-6pm
+  3: { open: 13 * 60, close: 19 * 60 },  // Wednesday 1pm-7pm
+  4: { open: 13 * 60, close: 19 * 60 },  // Thursday 1pm-7pm
+  5: { open:  9 * 60, close: 15 * 60 },  // Friday 9am-3pm
+  6: { open:  8 * 60, close: 14 * 60 },  // Saturday 8am-2pm
+};
+
+function getSalonHours(dateStr) {
+  // dateStr = "YYYY-MM-DD"
+  const d = new Date(dateStr + 'T12:00:00');
+  return SALON_HOURS[d.getDay()] || null; // null = closed
+}
+
+function isTimeInSalonHours(dateStr, timeStr, durationMins) {
+  // timeStr = "H:MM AM/PM" or similar, durationMins = minutes of service
+  const hours = getSalonHours(dateStr);
+  if (!hours) return false; // closed day
+  // Parse time to minutes since midnight
+  const t = timeStr.replace(/[^d:apmAPM ]/g,'').trim();
+  const isPM = /pm/i.test(t);
+  const isAM = /am/i.test(t);
+  const parts = t.replace(/[apm ]/gi,'').split(':');
+  let h = parseInt(parts[0]) || 0;
+  const m = parseInt(parts[1]) || 0;
+  if (isPM && h < 12) h += 12;
+  if (isAM && h === 12) h = 0;
+  const startMin = h * 60 + m;
+  const endMin = startMin + (durationMins || 60);
+  // Must start at or after open, and end by close
+  return startMin >= hours.open && endMin <= hours.close;
+}
+
 function scheduleExpired(entry) {
   return !entry || Date.now() - entry.fetchedAt > SCHEDULE_CACHE_TTL_MS;
 }
@@ -1386,7 +1422,10 @@ app.post("/find-openings", async (req, res) => {
     for (let d = 1; d <= daysToScan; d++) {
       const scanDate = new Date(etNow);
       scanDate.setDate(etNow.getDate() + d);
-      datesNeeded.push({ dateStr: formatYYYYMMDD(scanDate), dayName: scanDate.toLocaleDateString("en-US", { weekday: "long", timeZone: "America/New_York" }) });
+      const _ds = formatYYYYMMDD(scanDate);
+      if (getSalonHours(_ds)) {
+        datesNeeded.push({ dateStr: formatYYYYMMDD(scanDate), dayName: scanDate.toLocaleDateString("en-US", { weekday: "long", timeZone: "America/New_York" }) });
+      }
     }
 
     // Check if all needed dates are warm
@@ -1415,8 +1454,10 @@ app.post("/find-openings", async (req, res) => {
       console.log('[find-openings]', dateStr, '- using', appointments.length, 'cached appointments');
 
       // Find free slots with minGapMinutes of continuous free time
-      const openStart = 9 * 60;  // 9 AM
-      const openEnd = 18 * 60;   // 6 PM
+      const salonHrs = getSalonHours(dateStr);
+      if (!salonHrs) { console.log('[find-openings]', dateStr, 'is closed (no salon hours) - skipping'); continue; }
+      const openStart = salonHrs.open;
+      const openEnd = salonHrs.close;
       const step = 30;
       const freeSlots = [];
       for (let slotMin = openStart; slotMin <= openEnd - minGapMinutes; slotMin += step) {
