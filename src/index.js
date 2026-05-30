@@ -1465,5 +1465,4 @@ app.listen(PORT, () => {
     warmApptCacheForNextDays(5)
       .catch(e => console.warn("[interval] appt cache warm failed:", e?.message));
   }, 3 * 60 * 1000); // every 3 minutes
-}); }, STYLIST_CACHE_TTL_MS);
 });
