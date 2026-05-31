@@ -1727,12 +1727,14 @@ async function warmApptCacheForNextDays(numDays = 5) {
 
 app.listen(PORT, () => {
   console.log(`SalonBiz Playwright server listening on :${PORT}`);
-  // Warm stylist cache after 2s
+  /* DISABLED: Stylist cache warmer - causes timeout at startup
+// Warm stylist cache after 2s
   setTimeout(() => {
     getStylistsCached()
       .then(({ cached }) => console.log(`Stylist cache warmed (cached=${cached})`))
       .catch(e => console.warn("Stylist cache warmup failed:", e?.message || e));
   }, 2000);
+*/
   // Warm appointment cache after 5s, then every 3 minutes
   setTimeout(() => {
     warmApptCacheForNextDays(5)
