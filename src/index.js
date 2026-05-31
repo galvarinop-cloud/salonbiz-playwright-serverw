@@ -1633,38 +1633,38 @@ async function warmApptCacheForNextDays(numDays = 5) {
         // Wait for Angular to render appointment blocks (up to 8s)
         await page.waitForTimeout(2000);
         try {
-          await page.waitForSelector('.scheduler-appointment-block__container, .staff-header-item', {
+          await page.waitForSelector('.dhx_cal_event, .staff-header-item', {
             state: 'attached', timeout: 6000
           });
           await page.waitForTimeout(500); // Extra wait for all blocks to render
         } catch (waitErr) {
           // No blocks found yet - likely closed day or no appointments - continue
         }
-        // Scrape appointments using DOM structure (no bounding boxes needed in headless)
+        // Scrape appointments using dhx_cal_event (DHTMLX scheduler elements used by SalonBiz)
           const scrapedData = await page.evaluate(() => {
             const result = { appointments: [], stylistAppts: {} };
             
-            // Strategy 1: Find column containers and their appointment blocks
-            // SalonBiz calendar columns are typically direct children of the calendar grid
-            // Each column has a header (staff name) and appointment blocks
-            
-            // First, get stylist names from headers
+            // Get stylist headers with their x-positions for column mapping
             const headerEls = document.querySelectorAll('.staff-header-item, .dhx_scale_bar');
-            const stylistNames = [];
+            const columns = [];
             for (const h of headerEls) {
               const name = (h.textContent || '').trim().split(/\s+/)[0];
-              if (name && !name.toLowerCase().includes('head') && !name.toLowerCase().includes('room') && name.length > 1) {
-                stylistNames.push(name);
-                result.stylistAppts[name] = [];
-              }
+              if (!name || name.toLowerCase().includes('head') || name.toLowerCase().includes('room') || name.length < 2) continue;
+              const bb = h.getBoundingClientRect();
+              if (bb.width < 10) continue;
+              columns.push({ name, xMin: bb.x, xMax: bb.x + bb.width });
+              result.stylistAppts[name] = [];
             }
             
-            // Get all appointment blocks
-            const blocks = document.querySelectorAll('.scheduler-appointment-block__container');
-            
-            for (const block of blocks) {
-              const text = (block.textContent || '').replace(/\s+/g, ' ').trim();
-              // Match time like "11:00 am" or "3:15 pm" at start
+            // Use .dhx_cal_event - the DHTMLX calendar event elements
+            const events = document.querySelectorAll('.dhx_cal_event');
+            for (const ev of events) {
+              const ariaLabel = ev.getAttribute('aria-label') || '';
+              // Skip "Blocked/Not Working" entries - those are unavailable times
+              if (!ariaLabel || ariaLabel.toLowerCase().includes('blocked')) continue;
+              
+              const text = (ev.textContent || '').replace(/\s+/g, ' ').trim();
+              // Extract start time from text
               const timeMatch = text.match(/^(\d{1,2}):(\d{2})\s*(am|pm)/i);
               if (!timeMatch) continue;
               
@@ -1675,36 +1675,21 @@ async function warmApptCacheForNextDays(numDays = 5) {
               if (ampm === 'am' && h === 12) h = 0;
               const startMin = h * 60 + m;
               
-              // Estimate duration from block style (height)
-              // SalonBiz uses inline style height for appointment blocks
-              const style = block.getAttribute('style') || '';
-              const heightMatch = style.match(/height:\s*([\d.]+)px/);
-              let durationMin = 60; // default
-              if (heightMatch) {
-                // Typically SalonBiz uses ~2px per minute at 100% zoom
-                const px = parseFloat(heightMatch[1]);
-                if (px > 10) durationMin = Math.max(30, Math.round(px * 0.6));
-              }
+              // Get height for duration estimation
+              const bb = ev.getBoundingClientRect();
+              // SalonBiz uses ~2px per minute at default zoom
+              const estMins = bb.height > 5 ? Math.max(30, Math.round(bb.height * 0.65)) : 60;
+              const endMin = startMin + estMins;
               
-              const endMin = startMin + durationMin;
               result.appointments.push({ startMin, endMin });
               
-              // Try to determine which stylist column this is in
-              // Walk up the DOM to find the column container
-              let el = block.parentElement;
-              let colIdx = -1;
-              while (el && el !== document.body) {
-                // Check if this element is a column container
-                const siblings = el.parentElement ? Array.from(el.parentElement.children) : [];
-                if (siblings.length >= 2) {
-                  colIdx = siblings.indexOf(el);
-                  if (colIdx >= 0 && colIdx < stylistNames.length) break;
+              // Map to stylist column by x position
+              const cx = bb.x + bb.width / 2;
+              for (const col of columns) {
+                if (cx >= col.xMin - 10 && cx <= col.xMax + 10) {
+                  result.stylistAppts[col.name].push({ startMin, endMin });
+                  break;
                 }
-                el = el.parentElement;
-              }
-              
-              if (colIdx >= 0 && colIdx < stylistNames.length) {
-                result.stylistAppts[stylistNames[colIdx]].push({ startMin, endMin });
               }
             }
             
