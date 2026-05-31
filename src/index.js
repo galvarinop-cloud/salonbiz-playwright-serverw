@@ -403,7 +403,13 @@ async function typeaheadSelect(inputLocator, value) {
 }
 
 async function setTextInput(inputLocator, value) {
-  await inputLocator.click({ timeout: 15000 });
+  // Try normal click first, fall back to force:true if intercepted
+  try {
+    await inputLocator.click({ timeout: 8000 });
+  } catch(e) {
+    console.log('[setTextInput] Normal click failed, trying force click:', e.message?.substring(0,80));
+    await inputLocator.click({ timeout: 8000, force: true });
+  }
   await inputLocator.fill(String(value));
   // Trigger Angular change detection
   await inputLocator.evaluate((el, v) => {
@@ -862,7 +868,15 @@ async function handleRequestTypeModal(page) {
     await selectBtn.click({ timeout: 10000 });
     console.log('[requestType] Clicked Select Request Type');
   }
-  await page.waitForTimeout(1500);
+  // Wait for modal to ACTUALLY disappear (not just a fixed sleep)
+  try {
+    await page.waitForSelector('ngb-modal-window', { state: 'hidden', timeout: 8000 });
+    console.log('[requestType] Modal confirmed closed');
+  } catch(e) {
+    console.log('[requestType] Modal did not close within 8s, pressing Escape...');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(1500);
+  }
 }
 
 async function selectStaffViaModal(page, stylistFirstName) {
@@ -1371,13 +1385,27 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
   }
 
   await selectService(page, service); await page.waitForTimeout(1500);
+  // Set the start time and duration BEFORE opening staff modal (avoids modal blocking)
+  console.log('[runBooking] Setting startTime:', startTime, 'duration:', customDuration);
+  await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
+  await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
+  await page.waitForTimeout(500);
   // Select staff via the Staff Members modal (SalonBiz uses a modal, not a typeahead)
   console.log('[runBooking] Selecting staff via modal for:', stylist || 'any available');
   await selectStaffViaModal(page, stylist || null);
-  await page.waitForTimeout(1000);
-  // Set the start time
-  await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
-  await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
+  // Ensure no modal is blocking after staff selection
+  try {
+    const anyModal = await page.locator('ngb-modal-window').isVisible().catch(() => false);
+    if (anyModal) {
+      console.log('[runBooking] Modal still open after staff selection, waiting...');
+      await page.waitForSelector('ngb-modal-window', { state: 'hidden', timeout: 10000 });
+    }
+  } catch(e) {
+    console.log('[runBooking] Modal wait timeout, pressing Escape...');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(1500);
+  }
+  await page.waitForTimeout(500);
   if (requestReason) {
     await setTextInput(panel.locator('input[formcontrolname="requestReason"]').first(), requestReason).catch(() => {});
   }
