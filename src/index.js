@@ -1118,7 +1118,21 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
   }
 
   await selectService(page, service); await page.waitForTimeout(1500);
-  if (stylist) await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
+  // Wait for staff input to be visible before interacting
+  const staffInput = panel.locator('input[formcontrolname="staff"]').first();
+  if (stylist) {
+    let staffVisible = await staffInput.isVisible().catch(() => false);
+    if (!staffVisible) {
+      console.log('[runBooking] staff input not visible yet, waiting 3s...');
+      await page.waitForTimeout(3000);
+      staffVisible = await staffInput.isVisible().catch(() => false);
+    }
+    if (staffVisible) {
+      await typeaheadSelect(staffInput, stylist);
+    } else {
+      console.log('[runBooking] staff input still not visible, skipping stylist selection');
+    }
+  }
   await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
   await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
   if (requestReason) {
@@ -1619,31 +1633,74 @@ async function warmApptCacheForNextDays(numDays = 5) {
         await page.waitForTimeout(1500);
         const appointments = await page.evaluate(() => {
           const appts = [];
-          const events = document.querySelectorAll(
-            ".dhx_cal_event, .dhx_event_move, [class*='cal_event'], sbiz-appointment-block, [class*='appointment']"
-          );
-          for (const ev of events) {
-            const combined = (ev.getAttribute("aria-label") || "") + " " + (ev.textContent || "");
-            const timePattern = /(\d{1,2}):(\d{2})\s*(AM|PM)/gi;
-            const times = [];
-            let match;
-            while ((match = timePattern.exec(combined)) !== null) {
-              let h = parseInt(match[1], 10);
-              const m = parseInt(match[2], 10);
-              const ampm = match[3].toUpperCase();
-              if (ampm === "PM" && h !== 12) h += 12;
-              if (ampm === "AM" && h === 12) h = 0;
-              times.push(h * 60 + m);
-            }
-            if (times.length >= 2) {
-              appts.push({ startMin: times[0], endMin: times[times.length - 1] });
-            } else if (times.length === 1) {
-              appts.push({ startMin: times[0], endMin: times[0] + 60 });
-            }
+          // SalonBiz uses .scheduler-appointment-block__container (not dhx_cal_event)
+          const blocks = document.querySelectorAll('.scheduler-appointment-block__container');
+          for (const block of blocks) {
+            const text = (block.textContent || '').replace(/\s+/g, ' ').trim();
+            // Match time like "11:00 am" or "3:15 pm"
+            const timeMatch = text.match(/^(\d{1,2}):(\d{2})\s*(am|pm)/i);
+            if (!timeMatch) continue;
+            let h = parseInt(timeMatch[1], 10);
+            const m = parseInt(timeMatch[2], 10);
+            const ampm = timeMatch[3].toLowerCase();
+            if (ampm === 'pm' && h !== 12) h += 12;
+            if (ampm === 'am' && h === 12) h = 0;
+            const startMin = h * 60 + m;
+            // Estimate duration from block height (each 15min ≈ some px)
+            // Use bounding box height
+            const bb = block.getBoundingClientRect();
+            // Rough estimate: SalonBiz typically shows 1px per minute at normal zoom
+            // But we'll just use a default of 60min if we can't determine
+            const endMin = startMin + 60; // default 60 min
+            appts.push({ startMin, endMin });
           }
           return appts;
         });
-        const stylistAppts = await page.evaluate(() => { const result = {}; const cols = document.querySelectorAll('td.dhx_cal_data > div, .dhx_cal_data .dhx_matrix_cell, [class*="provider-column"], [class*="stylist-column"]'); const headers = document.querySelectorAll('td.dhx_cal_header > div > div, [class*="provider-header"], .dhx_cal_header .dhx_cal_header_cell'); if (headers.length > 0 && cols.length > 0) { headers.forEach((h, i) => { const name = (h.textContent || '').trim().split(/\s+/)[0]; if (!name || name.toLowerCase().includes('head spa')) return; result[name] = []; const col = cols[i]; if (!col) return; const evts = col.querySelectorAll('.dhx_cal_event, [class*="cal_event"], [class*="appointment"]'); evts.forEach(ev => { const combined = (ev.getAttribute('aria-label') || '') + ' ' + (ev.textContent || ''); const tp = /(\d{1,2}):(\d{2})\s*(AM|PM)/gi; const times = []; let m; while ((m = tp.exec(combined)) !== null) { let h2 = parseInt(m[1],10); const mn = parseInt(m[2],10); const ap = m[3].toUpperCase(); if (ap==='PM' && h2!==12) h2+=12; if (ap==='AM' && h2===12) h2=0; times.push(h2*60+mn); } if (times.length>=2) result[name].push({startMin:times[0],endMin:times[times.length-1]}); else if (times.length===1) result[name].push({startMin:times[0],endMin:times[0]+60}); }); }); } return result; }); apptCache.set(dateStr, { appointments, stylistAppts, fetchedAt: Date.now() });
+        // Scrape per-stylist appointments using column positions
+        const stylistAppts = await page.evaluate(() => {
+          const result = {};
+          // Get stylist headers and their x positions
+          const headers = document.querySelectorAll('.staff-header-item, .dhx_scale_bar');
+          const columns = [];
+          for (const h of headers) {
+            const name = (h.textContent || '').trim().split(/\s+/)[0];
+            if (!name || name.toLowerCase().includes('head') || name.toLowerCase().includes('room')) continue;
+            const bb = h.getBoundingClientRect();
+            if (bb.width < 10) continue;
+            columns.push({ name, xMin: bb.x, xMax: bb.x + bb.width });
+            result[name] = [];
+          }
+          if (columns.length === 0) return result;
+          // Map each appointment block to a stylist column
+          const blocks = document.querySelectorAll('.scheduler-appointment-block__container');
+          for (const block of blocks) {
+            const text = (block.textContent || '').replace(/\s+/g, ' ').trim();
+            const timeMatch = text.match(/^(\d{1,2}):(\d{2})\s*(am|pm)/i);
+            if (!timeMatch) continue;
+            let h = parseInt(timeMatch[1], 10);
+            const m = parseInt(timeMatch[2], 10);
+            const ampm = timeMatch[3].toLowerCase();
+            if (ampm === 'pm' && h !== 12) h += 12;
+            if (ampm === 'am' && h === 12) h = 0;
+            const startMin = h * 60 + m;
+            const bb = block.getBoundingClientRect();
+            const cx = bb.x + bb.width / 2;
+            // Find which column this block belongs to
+            for (const col of columns) {
+              if (cx >= col.xMin - 5 && cx <= col.xMax + 5) {
+                // Estimate end time from block height
+                // SalonBiz calendar: approximate 1 min ≈ some pixels
+                // Use block height to estimate duration; min 30min
+                const heightPx = bb.height;
+                const estMins = Math.max(30, Math.round(heightPx * 0.8));
+                result[col.name].push({ startMin, endMin: startMin + estMins });
+                break;
+              }
+            }
+          }
+          return result;
+        });
+        apptCache.set(dateStr, { appointments, stylistAppts, fetchedAt: Date.now() });
         console.log('[warmApptCache]', dateStr, '-', appointments.length, 'appointments cached');
       } catch (e) {
         console.warn('[warmApptCache] Failed for', dateStr, ':', e.message);
