@@ -822,13 +822,15 @@ async function handleRequestTypeModal(page) {
   const isOpen = await modal.isVisible().catch(() => false);
   if (!isOpen) { console.log('[requestType] No modal open'); return; }
 
-  const title = await modal.locator('.modal-title, h4, h5').first().innerText().catch(() => '');
-  console.log('[requestType] Modal title:', title);
-  if (!title.toLowerCase().includes('request') && !title.toLowerCase().includes('type')) {
+  const title = await modal.locator('.modal-title, h4, h5, .modal-header').first().innerText().catch(() => '');
+  console.log('[requestType] Modal title:', JSON.stringify(title));
+  // Check if this looks like a Request Type modal by title OR by presence of request-type rows
+  const hasRRRow = await modal.locator('text=/Return Request|New Request|Standing|Non-Request/i').first().isVisible().catch(() => false);
+  const isRequestModal = title.toLowerCase().includes('request') || title.toLowerCase().includes('type') || hasRRRow;
+  if (!isRequestModal) {
     console.log('[requestType] Not a request type modal, skipping');
     return;
   }
-
   console.log('[requestType] Request Type modal open - selecting Return Request or first option');
 
   // Try to find and click "Return Request" row
@@ -880,47 +882,39 @@ async function handleRequestTypeModal(page) {
 }
 
 async function selectStaffViaModal(page, stylistFirstName) {
-  // The staff cell opens a "Staff Members" modal when clicked/typed into
-  // We need to: open modal, find stylist by name, click row, click "Select Staff Member"
   const panel = page.locator("sbiz-book-right-panel");
   const staffInput = panel.locator('input[formcontrolname="staff"]').first();
 
-  // Check if staff input is visible
   const staffVisible = await staffInput.isVisible().catch(() => false);
   if (!staffVisible) {
     console.log('[selectStaff] staff input not visible, skipping');
     return false;
   }
 
-  // Triple-click + Delete opens the Staff Members modal
+  // Triple-click + Delete to open Staff Members modal
   await staffInput.click({ timeout: 10000, clickCount: 3 });
   await page.keyboard.press('Delete');
   await page.waitForTimeout(1500);
 
-  // Check if Staff Members modal opened
-  const staffModal = page.locator('text="Staff Members"').first();
-  const modalOpen = await staffModal.isVisible().catch(() => false);
-  if (!modalOpen) {
-    // Try typing a character instead
+  // If modal didn't open, try typing a character
+  const staffModalCheck = page.locator('text="Staff Members"').first();
+  if (!(await staffModalCheck.isVisible().catch(() => false))) {
     await staffInput.click({ timeout: 8000 });
     await staffInput.type('a', { delay: 50 });
     await page.waitForTimeout(1500);
   }
 
-  // Look for the modal
   const modal = page.locator('ngb-modal-window').first();
   const isModalOpen = await modal.isVisible().catch(() => false);
-
   if (!isModalOpen) {
-    console.log('[selectStaff] Staff Members modal did not open - trying to proceed without staff selection');
-    // Clear the input and move on
+    console.log('[selectStaff] Staff Members modal did not open, skipping staff selection');
     await staffInput.fill('').catch(() => {});
     return false;
   }
-
   console.log('[selectStaff] Staff Members modal open');
+  await page.screenshot({ path: '/tmp/staff_modal_open.png', fullPage: false }).catch(() => {});
 
-  // If a specific stylist was requested, search for them
+  // Search for specific stylist if requested
   if (stylistFirstName) {
     const searchBox = modal.locator('input[placeholder], input[type="text"]').last();
     if (await searchBox.isVisible().catch(() => false)) {
@@ -930,61 +924,85 @@ async function selectStaffViaModal(page, stylistFirstName) {
     }
   }
 
-  // Find staff rows - look for rows with the stylist name
-  const staffRows = modal.locator('table tbody tr, .sbiz-data-list__row:not(.sbiz-data-list__row--header), tr[role="row"]');
-  const rowCount = await staffRows.count().catch(() => 0);
-  console.log('[selectStaff] Staff rows found:', rowCount);
+  // Get all row texts to understand structure
+  const allRowEls = modal.locator('table tbody tr, .sbiz-data-list__row:not(.sbiz-data-list__row--header)');
+  const totalRows = await allRowEls.count().catch(() => 0);
+  const rowTexts = [];
+  for (let i = 0; i < Math.min(totalRows, 15); i++) {
+    const t = (await allRowEls.nth(i).innerText().catch(() => '')).trim();
+    rowTexts.push(t);
+  }
+  console.log('[selectStaff] All row texts:', JSON.stringify(rowTexts));
 
-  if (rowCount === 0) {
-    // No staff found with this filter - if we searched, clear and show all
-    if (stylistFirstName) {
-      const searchBox = modal.locator('input[placeholder], input[type="text"]').last();
-      const clearBtn = modal.locator('button:has-text("×"), [aria-label="Clear"], button.clear').first();
-      if (await clearBtn.isVisible().catch(() => false)) await clearBtn.click();
-      else if (await searchBox.isVisible().catch(() => false)) await searchBox.fill('');
-      await page.waitForTimeout(1000);
-    }
-    // Try clicking first available row
-    const allRows = modal.locator('table tbody tr, tr[role="row"]');
-    const allCount = await allRows.count().catch(() => 0);
-    console.log('[selectStaff] All rows after clear:', allCount);
-    if (allCount > 0) {
-      await allRows.first().click({ timeout: 8000 });
-      await page.waitForTimeout(500);
-    }
-  } else {
-    // Try to find the requested stylist
-    let found = false;
-    if (stylistFirstName) {
-      const nameLower = stylistFirstName.toLowerCase();
-      for (let i = 0; i < rowCount; i++) {
-        const rowText = (await staffRows.nth(i).innerText().catch(() => '')).toLowerCase();
-        if (rowText.includes(nameLower)) {
-          await staffRows.nth(i).click({ timeout: 8000 });
-          found = true;
-          console.log('[selectStaff] Found and clicked:', rowText.substring(0,50));
-          break;
-        }
+  // A real staff row has at least 2 words (First Last name) and is NOT a lone category label.
+  // Category labels like "Artistic Educator" appear with no tab-separated columns.
+  // Real staff rows have name + columns separated by tabs/newlines.
+  const isRealStaffRow = (text) => {
+    const t = text.trim();
+    if (!t || t.toLowerCase().includes('no records')) return false;
+    // Has tab or newline = multi-column row = real data
+    if (t.includes('	') || t.includes('
+')) return true;
+    // Single line with 2+ capitalized words = likely a name
+    const words = t.split(/s+/).filter(w => w.length > 1);
+    if (words.length >= 2 && /^[A-Z]/.test(words[0]) && /^[A-Z]/.test(words[1])) return true;
+    return false;
+  };
+
+  let clicked = false;
+
+  if (stylistFirstName) {
+    const nameLower = stylistFirstName.toLowerCase();
+    for (let i = 0; i < rowTexts.length; i++) {
+      if (rowTexts[i].toLowerCase().includes(nameLower) && isRealStaffRow(rowTexts[i])) {
+        await allRowEls.nth(i).click({ timeout: 8000 });
+        clicked = true;
+        console.log('[selectStaff] Clicked stylist row:', rowTexts[i].substring(0,60).trim());
+        break;
       }
     }
-    if (!found) {
-      // Click first available row
-      await staffRows.first().click({ timeout: 8000 });
-      const firstRowText = await staffRows.first().innerText().catch(() => '');
-      console.log('[selectStaff] Clicked first row:', firstRowText.substring(0,50));
+  }
+
+  if (!clicked) {
+    for (let i = 0; i < rowTexts.length; i++) {
+      if (isRealStaffRow(rowTexts[i])) {
+        await allRowEls.nth(i).click({ timeout: 8000 });
+        clicked = true;
+        console.log('[selectStaff] Clicked first real staff row:', rowTexts[i].substring(0,60).trim());
+        break;
+      }
     }
   }
-  await page.waitForTimeout(600);
 
-  // Click "Select Staff Member" button
+  if (!clicked && totalRows > 0) {
+    await allRowEls.first().click({ timeout: 8000 });
+    console.log('[selectStaff] Last resort - clicked row 0:', rowTexts[0]?.substring(0,60));
+  }
+
+  await page.waitForTimeout(800);
+
+  // Click "Select Staff Member"
   const selectBtn = modal.locator('button:has-text("Select Staff Member"), button:has-text("Select")').last();
   if (await selectBtn.isVisible().catch(() => false)) {
     await selectBtn.click({ timeout: 10000 });
     console.log('[selectStaff] Clicked Select Staff Member');
+  } else {
+    console.log('[selectStaff] Select Staff Member button NOT visible');
+    await page.screenshot({ path: '/tmp/staff_no_select_btn.png', fullPage: false }).catch(() => {});
   }
-  await page.waitForTimeout(1500);
 
-  // Handle Request Type modal that appears after staff selection
+  // Wait for Staff Members modal to close
+  try {
+    await page.waitForSelector('ngb-modal-window', { state: 'hidden', timeout: 8000 });
+    console.log('[selectStaff] Staff Members modal closed');
+  } catch(e) {
+    console.log('[selectStaff] Staff Members modal still open - pressing Escape');
+    await page.screenshot({ path: '/tmp/staff_modal_stuck.png', fullPage: false }).catch(() => {});
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(1000);
+  }
+
+  // Handle Request Type modal
   await handleRequestTypeModal(page);
 
   return true;
