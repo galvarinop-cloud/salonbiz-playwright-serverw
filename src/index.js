@@ -21,7 +21,7 @@ const COOKIE_TTL_MS = Number(process.env.COOKIE_TTL_MS || 1000 * 60 * 60 * 6);
 
 const PHONE_BOOKABLE_SERVICES_RAW = process.env.PHONE_BOOKABLE_SERVICES || "";
 const PHONE_BOOKABLE_SERVICES = new Set(
-  PHONE_BOOKABLE_SERVICES_RAW.split(/\r?\n|,/).map((s) => s.trim()).filter(Boolean)
+  PHONE_BOOKABLE_SERVICES_RAW.split(/\r?\n|,/).map((s) => s.trim()).filter(Boolean)h
 );
 
 let stylistCache = { value: null, fetchedAt: 0 };
@@ -907,7 +907,7 @@ async function selectExistingClient(page, nameStr, phoneStr) {
   // ── Step 6: Click row then Select ────────────────────────────────────
   const doClickRowAndSelect = async () => {
     // Click the row using page.evaluate with the correct selector
-    await page.evaluate((sel, idx) => {
+    await page.evaluate(({sel, idx}) => {
       const m = document.querySelector('ngb-modal-window');
       const rows = Array.from(m.querySelectorAll(sel));
       const row = rows[idx];
@@ -918,7 +918,7 @@ async function selectExistingClient(page, nameStr, phoneStr) {
         row.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0 }));
         row.click();
       }
-    }, ROW_SEL, bestIdx);
+    }, {sel: ROW_SEL, idx: bestIdx});
     await page.waitForTimeout(800);
 
     // Click Select button
@@ -1545,7 +1545,7 @@ app.post("/find-openings", async (req, res) => {
       const freeSlots = [];
       for (let slotMin = openStart; slotMin <= openEnd - minGapMinutes; slotMin += step) {
         const slotEnd = slotMin + minGapMinutes;
-        const isBusy = appointments.some(a => a.startMin < slotEnd && a.endMin > slotMin);
+        const stylistAppts = cached && cached.stylistAppts; const totalStylists = stylistAppts ? Object.keys(stylistAppts).length : 0; let isBusy; if (stylistAppts && totalStylists > 0) { const busyCount = Object.values(stylistAppts).filter(sa => sa.some(a => a.startMin < slotEnd && a.endMin > slotMin)).length; isBusy = busyCount >= totalStylists; } else { const overlapping = appointments.filter(a => a.startMin < slotEnd && a.endMin > slotMin).length; isBusy = overlapping >= 6; }
         if (!isBusy) {
           freeSlots.push(spokenTime(minutesToTimeStr(slotMin)));
         }
@@ -1643,7 +1643,7 @@ async function warmApptCacheForNextDays(numDays = 5) {
           }
           return appts;
         });
-        apptCache.set(dateStr, { appointments, fetchedAt: Date.now() });
+        const stylistAppts = await page.evaluate(() => { const result = {}; const cols = document.querySelectorAll('td.dhx_cal_data > div, .dhx_cal_data .dhx_matrix_cell, [class*="provider-column"], [class*="stylist-column"]'); const headers = document.querySelectorAll('td.dhx_cal_header > div > div, [class*="provider-header"], .dhx_cal_header .dhx_cal_header_cell'); if (headers.length > 0 && cols.length > 0) { headers.forEach((h, i) => { const name = (h.textContent || '').trim().split(/\s+/)[0]; if (!name || name.toLowerCase().includes('head spa')) return; result[name] = []; const col = cols[i]; if (!col) return; const evts = col.querySelectorAll('.dhx_cal_event, [class*="cal_event"], [class*="appointment"]'); evts.forEach(ev => { const combined = (ev.getAttribute('aria-label') || '') + ' ' + (ev.textContent || ''); const tp = /(\d{1,2}):(\d{2})\s*(AM|PM)/gi; const times = []; let m; while ((m = tp.exec(combined)) !== null) { let h2 = parseInt(m[1],10); const mn = parseInt(m[2],10); const ap = m[3].toUpperCase(); if (ap==='PM' && h2!==12) h2+=12; if (ap==='AM' && h2===12) h2=0; times.push(h2*60+mn); } if (times.length>=2) result[name].push({startMin:times[0],endMin:times[times.length-1]}); else if (times.length===1) result[name].push({startMin:times[0],endMin:times[0]+60}); }); }); } return result; }); apptCache.set(dateStr, { appointments, stylistAppts, fetchedAt: Date.now() });
         console.log('[warmApptCache]', dateStr, '-', appointments.length, 'appointments cached');
       } catch (e) {
         console.warn('[warmApptCache] Failed for', dateStr, ':', e.message);
