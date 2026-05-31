@@ -405,6 +405,16 @@ async function typeaheadSelect(inputLocator, value) {
 async function setTextInput(inputLocator, value) {
   await inputLocator.click({ timeout: 15000 });
   await inputLocator.fill(String(value));
+  // Trigger Angular change detection
+  await inputLocator.evaluate((el, v) => {
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (nativeSetter) {
+      nativeSetter.call(el, v);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+    }
+  }, String(value)).catch(() => {});
 }
 
 async function readNgbTypeaheadOptions(page) {
@@ -737,42 +747,100 @@ async function selectService(page, serviceStr) {
   const panel = page.locator("sbiz-book-right-panel");
   const serviceInput = panel.locator('input[formcontrolname="service"]').first();
 
-  // Wait for service input to be visible
   await serviceInput.waitFor({ state: "visible", timeout: 15000 });
-  await serviceInput.click({ timeout: 15000 });
-  await serviceInput.fill("");
-  await serviceInput.type(String(serviceStr), { delay: 25 });
-  await page.waitForTimeout(1000);
 
-  // Check if a dropdown appeared
-  const dropdown = page.locator("ngb-typeahead-window.dropdown-menu.show").first();
-  const dropdownVisible = await dropdown.isVisible().catch(() => false);
+  // Try up to 3 times to get a proper selection
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await serviceInput.click({ timeout: 15000 });
+    await serviceInput.fill("");
+    await page.waitForTimeout(300);
+    await serviceInput.type(String(serviceStr), { delay: 40 });
+    await page.waitForTimeout(1200);
 
-  if (dropdownVisible) {
-    // Try to find the best matching option
-    const items = dropdown.locator("button.dropdown-item");
-    const count = await items.count().catch(() => 0);
-    const serviceNameLower = serviceStr.toLowerCase();
-    let clicked = false;
-    for (let i = 0; i < count; i++) {
-      const text = (await items.nth(i).innerText().catch(() => "")).toLowerCase();
-      if (text.includes(serviceNameLower) || serviceNameLower.includes(text.replace(/\s+/g,' ').trim().substring(0,10))) {
-        await items.nth(i).click({ timeout: 10000 });
+    // Check if dropdown appeared
+    const dropdown = page.locator("ngb-typeahead-window.dropdown-menu.show").first();
+    const dropdownVisible = await dropdown.isVisible().catch(() => false);
+
+    if (dropdownVisible) {
+      const items = dropdown.locator("button.dropdown-item");
+      const count = await items.count().catch(() => 0);
+      console.log('[selectService] attempt', attempt+1, '- dropdown has', count, 'items');
+      const serviceNameLower = serviceStr.toLowerCase();
+      let clicked = false;
+      // Try exact match first
+      for (let i = 0; i < count; i++) {
+        const text = (await items.nth(i).innerText().catch(() => "")).toLowerCase().trim();
+        if (text === serviceNameLower) {
+          await items.nth(i).click({ timeout: 10000 });
+          clicked = true;
+          console.log('[selectService] Clicked exact match:', text);
+          break;
+        }
+      }
+      // Try partial match
+      if (!clicked) {
+        for (let i = 0; i < count; i++) {
+          const text = (await items.nth(i).innerText().catch(() => "")).toLowerCase();
+          if (text.includes(serviceNameLower.substring(0, 8)) || serviceNameLower.includes(text.replace(/s+/g,' ').trim().substring(0,10))) {
+            await items.nth(i).click({ timeout: 10000 });
+            clicked = true;
+            console.log('[selectService] Clicked partial match:', text);
+            break;
+          }
+        }
+      }
+      if (!clicked && count > 0) {
+        await items.first().click({ timeout: 10000 });
+        console.log('[selectService] Clicked first item as fallback');
         clicked = true;
-        console.log("[selectService] Clicked typeahead item:", text);
+      }
+      if (clicked) {
+        await page.waitForTimeout(800);
+        // Verify the service input has the selected text (not still showing the search text)
+        const fieldVal = await serviceInput.inputValue().catch(() => '');
+        console.log('[selectService] field value after select:', fieldVal.substring(0, 40));
+        if (fieldVal && fieldVal.length > 3) break; // selection took hold
+      }
+    } else {
+      // No dropdown - try keyboard navigation
+      console.log('[selectService] No dropdown on attempt', attempt+1, '- trying keyboard');
+      await page.keyboard.press("ArrowDown");
+      await page.waitForTimeout(400);
+      // Check again for dropdown
+      const ddAgain = await dropdown.isVisible().catch(() => false);
+      if (ddAgain) {
+        await page.keyboard.press("Enter");
+        console.log('[selectService] Used ArrowDown+Enter after re-check');
+        await page.waitForTimeout(800);
+        const fieldVal = await serviceInput.inputValue().catch(() => '');
+        console.log('[selectService] field value after keyboard select:', fieldVal.substring(0, 40));
+        if (fieldVal && fieldVal.length > 3) break;
+      } else {
+        // Last resort: clear and try shorter prefix
+        const shortPrefix = serviceStr.substring(0, 5);
+        await serviceInput.click();
+        await serviceInput.fill("");
+        await serviceInput.type(shortPrefix, { delay: 50 });
+        await page.waitForTimeout(1000);
+        const ddFinal = await dropdown.isVisible().catch(() => false);
+        if (ddFinal) {
+          const items2 = dropdown.locator("button.dropdown-item");
+          const c2 = await items2.count().catch(() => 0);
+          if (c2 > 0) {
+            await items2.first().click({ timeout: 10000 });
+            console.log('[selectService] Clicked first item with short prefix fallback');
+            await page.waitForTimeout(800);
+            break;
+          }
+        }
+        await page.keyboard.press("ArrowDown");
+        await page.keyboard.press("Enter");
+        console.log('[selectService] Final fallback ArrowDown+Enter');
+        await page.waitForTimeout(800);
         break;
       }
     }
-    if (!clicked && count > 0) {
-      await items.first().click({ timeout: 10000 });
-      console.log("[selectService] Clicked first typeahead item as fallback");
-    }
-  } else {
-    // Try keyboard: ArrowDown + Enter
-    await page.keyboard.press("ArrowDown");
-    await page.waitForTimeout(300);
-    await page.keyboard.press("Enter");
-    console.log('[selectService] Used ArrowDown+Enter fallback'); await page.waitForTimeout(800);
+    if (attempt < 2) await page.waitForTimeout(500);
   }
 
   await page.waitForTimeout(500);
@@ -1016,23 +1084,77 @@ async function createNewClientInModal(page, { customerName, customerPhone, custo
 
 async function clickFinalAppointmentCreate(page) {
   const panel = page.locator("sbiz-book-right-panel");
+  
+  // Scroll to bottom of panel to ensure Create button is visible
+  await panel.evaluate(el => { const sc = el.querySelector('.scrollable, .sbiz-panel__body'); if (sc) sc.scrollTop = sc.scrollHeight; }).catch(() => {});
+  await page.waitForTimeout(500);
+  
   const candidates = [
     panel.locator('.sbiz-btn--primary:has-text("Create")'),
     panel.locator('button.sbiz-btn--primary:has-text("Create")'),
     panel.locator('button[type="submit"]:has-text("Create")'),
     panel.locator('button:has-text("Create")')
   ];
+  
+  let clicked = false;
   for (const loc of candidates) {
     const count = await loc.count().catch(() => 0);
     if (count > 0) {
-      const btn = loc.last(); await btn.waitFor({state:'visible', timeout: 5000}).catch(()=>{}); const enabled = await btn.evaluate(el => !el.disabled && !el.hasAttribute('disabled')).catch(()=>false); if (enabled) { await btn.click({ timeout: 15000 }); return true; } const visible = await btn.isVisible().catch(()=>false); if (visible) { try { await btn.click({timeout: 15000, force: true}); return true; } catch(e) { console.warn('[createBtn] click failed:', e.message); } }
-      // visible check already handled above
-      // handled above
+      const btn = loc.last();
+      const visible = await btn.isVisible().catch(() => false);
+      if (!visible) continue;
+      const enabled = await btn.evaluate(el => !el.disabled && !el.hasAttribute('disabled')).catch(() => false);
+      if (enabled) {
+        await btn.scrollIntoViewIfNeeded().catch(() => {});
+        await btn.click({ timeout: 15000 });
+        clicked = true;
+        console.log('[createBtn] Clicked Create button');
+        break;
+      }
+      // Try force click if disabled check failed
+      try {
+        await btn.scrollIntoViewIfNeeded().catch(() => {});
+        await btn.click({ timeout: 15000, force: true });
+        clicked = true;
+        console.log('[createBtn] Force-clicked Create button');
+        break;
+      } catch(e) {
+        console.warn('[createBtn] click failed:', e.message);
+      }
     }
   }
+  
+  if (!clicked) {
+    console.warn('[createBtn] No Create button found in panel');
+    return false;
+  }
+  
+  // Wait and verify the booking panel closed (appointment confirmed)
+  // SalonBiz closes the right panel after successful Create
+  console.log('[createBtn] Waiting for panel to close after Create...');
+  for (let i = 0; i < 12; i++) {
+    await page.waitForTimeout(1000);
+    // Check if the service input (main indicator of open booking panel) is gone
+    const serviceInputVisible = await panel.locator('input[formcontrolname="service"]').isVisible().catch(() => false);
+    const startTimeInputVisible = await panel.locator('input[formcontrolname="startTime"]').isVisible().catch(() => false);
+    if (!serviceInputVisible && !startTimeInputVisible) {
+      console.log('[createBtn] Panel closed after', i+1, 'seconds - appointment created!');
+      return true;
+    }
+    // Check for success toast/notification
+    const toast = await page.locator('.toast-success, .sbiz-toast--success, [class*="success"]').isVisible().catch(() => false);
+    if (toast) {
+      console.log('[createBtn] Success toast detected!');
+      return true;
+    }
+    console.log('[createBtn] Panel still open after', i+1, 'seconds...');
+  }
+  
+  // Panel didn't close after 12 seconds - booking may have failed
+  console.warn('[createBtn] Panel still open after 12s wait - booking may not have been created');
+  await page.screenshot({ path: '/tmp/create_panel_stuck.png', fullPage: true }).catch(() => {});
   return false;
 }
-
 async function checkForBlockedBanner(page) {
   await page.waitForTimeout(1200);
   const blockedBanner = page.locator("text=/blocked by/i").first();
@@ -1457,10 +1579,11 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
 
     if (!result.clickedFinalCreate) {
       await page.screenshot({ path: "/tmp/appt_create_not_found.png", fullPage: true }).catch(() => {});
+      console.error('[book] Create button not found or booking form did not submit - check /debug/appt_create_not_found.png');
       return vapiRespond(res, toolCallId, {
         ok: false,
         booked: false,
-        reason: "Could not find the Create button in SalonBiz.",
+        reason: "Booking form did not complete - Create button not found or form validation failed.",
         message: "Something went wrong placing the booking. Please try again.",
         debugScreenshot: "/debug/appt_create_not_found.png"
       });
@@ -1598,6 +1721,7 @@ app.post("/book/status", async (req, res) => {
 });
 
 // ── Debug screenshot routes ──────────────────────────────────────
+app.get("/debug/create_panel_stuck.png", (req, res) => res.sendFile("/tmp/create_panel_stuck.png"));
 app.get("/debug/appt_after.png", (req, res) => res.sendFile("/tmp/appt_after.png"));
 app.get("/debug/appt_create_not_found.png", (req, res) => res.sendFile("/tmp/appt_create_not_found.png"));
 app.get("/debug/appt_blocked.png", (req, res) => res.sendFile("/tmp/appt_blocked.png"));
