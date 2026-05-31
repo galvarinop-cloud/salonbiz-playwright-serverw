@@ -1634,15 +1634,23 @@ async function warmApptCacheForNextDays(numDays = 5) {
       const dateStr = formatYYYYMMDD(scanDate);
       try {
         await navigateToDate(page, dateStr);
-        // Wait for Angular to render appointment blocks (up to 8s)
-        await page.waitForTimeout(2000);
+        // Wait for DHTMLX calendar events to render
+        // navigateToDate uses URL navigation - DHTMLX needs a date click to render events
+        await page.waitForTimeout(1500);
+        // Click the active date in header to trigger DHTMLX event rendering
         try {
-          await page.waitForSelector('.dhx_cal_event, .staff-header-item', {
-            state: 'attached', timeout: 6000
-          });
-          await page.waitForTimeout(500); // Extra wait for all blocks to render
+          const activeDateBtn = page.locator('.dhx_cal_nav_row button.active, .dhx_cal_today_label, [class*="active"][class*="day"]').first();
+          if (await activeDateBtn.isVisible().catch(() => false)) {
+            await activeDateBtn.click().catch(() => {});
+            await page.waitForTimeout(1000);
+          }
+        } catch (e) {}
+        // Wait for events to appear (up to 5s)
+        try {
+          await page.waitForSelector('.dhx_cal_event', { state: 'attached', timeout: 5000 });
+          await page.waitForTimeout(500);
         } catch (waitErr) {
-          // No blocks found yet - likely closed day or no appointments - continue
+          // No events found - closed day or no appointments today
         }
         // Scrape appointments using dhx_cal_event (DHTMLX scheduler elements used by SalonBiz)
           const scrapedData = await page.evaluate(() => {
