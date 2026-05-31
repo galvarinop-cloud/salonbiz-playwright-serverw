@@ -1422,6 +1422,7 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
   // ── Run booking synchronously ───────────────────────────────
   // We set a timeout so we don't hang forever
   const timeoutMs = BOOK_TIMEOUT_MS;
+  _bookingInProgress = true;
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
   const { context, page } = await getPage(browser);
   let step = "start";
@@ -1495,6 +1496,7 @@ const startDate = resolveStartDate(args.startDate || args.date || "", startTime)
       debugScreenshot: "/debug/book_error.png"
     }, 500);
   } finally {
+    _bookingInProgress = false;
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
@@ -1610,10 +1612,12 @@ app.get("/debug/new_client_before_create.png", (req, res) => res.sendFile("/tmp/
 
 // ── Background appointment cache warmer (single browser, sequential) ──
 let _warmLock = false; // prevent concurrent warm runs
+let _bookingInProgress = false; // prevent warmer from running during booking
+ // prevent concurrent warm runs
 
 async function warmApptCacheForNextDays(numDays = 5) {
-  if (_warmLock) {
-    console.log('[warmApptCache] Already running, skipping');
+  if (_warmLock || _bookingInProgress) {
+    console.log('[warmApptCache] Skipping - already running or booking in progress');
     return;
   }
   _warmLock = true;
