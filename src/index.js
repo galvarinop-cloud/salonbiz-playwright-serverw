@@ -746,105 +746,236 @@ function vapiError(res, toolCallId, message, statusCode = 200) {
 async function selectService(page, serviceStr) {
   const panel = page.locator("sbiz-book-right-panel");
   const serviceInput = panel.locator('input[formcontrolname="service"]').first();
-
   await serviceInput.waitFor({ state: "visible", timeout: 15000 });
 
-  // Try up to 3 times to get a proper selection
   for (let attempt = 0; attempt < 3; attempt++) {
-    await serviceInput.click({ timeout: 15000 });
+    await serviceInput.click({ timeout: 10000 });
     await serviceInput.fill("");
     await page.waitForTimeout(300);
-    await serviceInput.type(String(serviceStr), { delay: 40 });
+    // Type partial name to trigger dropdown
+    const partial = String(serviceStr).substring(0, 6);
+    await serviceInput.type(partial, { delay: 60 });
     await page.waitForTimeout(1200);
 
-    // Check if dropdown appeared
     const dropdown = page.locator("ngb-typeahead-window.dropdown-menu.show").first();
     const dropdownVisible = await dropdown.isVisible().catch(() => false);
-
     if (dropdownVisible) {
       const items = dropdown.locator("button.dropdown-item");
       const count = await items.count().catch(() => 0);
-      console.log('[selectService] attempt', attempt+1, '- dropdown has', count, 'items');
-      const serviceNameLower = serviceStr.toLowerCase();
+      console.log('[selectService] attempt', attempt+1, 'dropdown items:', count);
+      const svcLower = String(serviceStr).toLowerCase();
       let clicked = false;
-      // Try exact match first
+      // Exact match first
       for (let i = 0; i < count; i++) {
         const text = (await items.nth(i).innerText().catch(() => "")).toLowerCase().trim();
-        if (text === serviceNameLower) {
-          await items.nth(i).click({ timeout: 10000 });
-          clicked = true;
-          console.log('[selectService] Clicked exact match:', text);
-          break;
-        }
+        if (text === svcLower) { await items.nth(i).click({ timeout: 8000 }); clicked = true; console.log('[selectService] exact match:', text); break; }
       }
-      // Try partial match
+      // Partial match
       if (!clicked) {
         for (let i = 0; i < count; i++) {
-          const text = (await items.nth(i).innerText().catch(() => "")).toLowerCase();
-          if (text.includes(serviceNameLower.substring(0, 8)) || serviceNameLower.includes(text.replace(/s+/g,' ').trim().substring(0,10))) {
-            await items.nth(i).click({ timeout: 10000 });
-            clicked = true;
-            console.log('[selectService] Clicked partial match:', text);
-            break;
+          const text = (await items.nth(i).innerText().catch(() => "")).toLowerCase().trim();
+          if (text.includes(svcLower.substring(0,8)) || svcLower.includes(text.substring(0,8))) {
+            await items.nth(i).click({ timeout: 8000 }); clicked = true; console.log('[selectService] partial match:', text); break;
           }
         }
       }
-      if (!clicked && count > 0) {
-        await items.first().click({ timeout: 10000 });
-        console.log('[selectService] Clicked first item as fallback');
-        clicked = true;
-      }
-      if (clicked) {
-        await page.waitForTimeout(800);
-        // Verify the service input has the selected text (not still showing the search text)
-        const fieldVal = await serviceInput.inputValue().catch(() => '');
-        console.log('[selectService] field value after select:', fieldVal.substring(0, 40));
-        if (fieldVal && fieldVal.length > 3) break; // selection took hold
-      }
+      if (!clicked && count > 0) { await items.first().click({ timeout: 8000 }); clicked = true; console.log('[selectService] first fallback'); }
+      if (clicked) { await page.waitForTimeout(800); break; }
     } else {
-      // No dropdown - try keyboard navigation
-      console.log('[selectService] No dropdown on attempt', attempt+1, '- trying keyboard');
-      await page.keyboard.press("ArrowDown");
-      await page.waitForTimeout(400);
-      // Check again for dropdown
-      const ddAgain = await dropdown.isVisible().catch(() => false);
-      if (ddAgain) {
-        await page.keyboard.press("Enter");
-        console.log('[selectService] Used ArrowDown+Enter after re-check');
-        await page.waitForTimeout(800);
-        const fieldVal = await serviceInput.inputValue().catch(() => '');
-        console.log('[selectService] field value after keyboard select:', fieldVal.substring(0, 40));
-        if (fieldVal && fieldVal.length > 3) break;
-      } else {
-        // Last resort: clear and try shorter prefix
-        const shortPrefix = serviceStr.substring(0, 5);
-        await serviceInput.click();
-        await serviceInput.fill("");
-        await serviceInput.type(shortPrefix, { delay: 50 });
-        await page.waitForTimeout(1000);
-        const ddFinal = await dropdown.isVisible().catch(() => false);
-        if (ddFinal) {
-          const items2 = dropdown.locator("button.dropdown-item");
-          const c2 = await items2.count().catch(() => 0);
-          if (c2 > 0) {
-            await items2.first().click({ timeout: 10000 });
-            console.log('[selectService] Clicked first item with short prefix fallback');
-            await page.waitForTimeout(800);
-            break;
+      // Try shorter prefix
+      await serviceInput.fill("");
+      await serviceInput.type(String(serviceStr).substring(0,3), { delay: 80 });
+      await page.waitForTimeout(1000);
+      const dd2 = await dropdown.isVisible().catch(() => false);
+      if (dd2) {
+        const items2 = dropdown.locator("button.dropdown-item");
+        const c2 = await items2.count().catch(() => 0);
+        const svcLower = String(serviceStr).toLowerCase();
+        for (let i = 0; i < c2; i++) {
+          const text = (await items2.nth(i).innerText().catch(() => "")).toLowerCase().trim();
+          if (text.includes(svcLower.substring(0,6)) || svcLower.includes(text.substring(0,6))) {
+            await items2.nth(i).click({ timeout: 8000 }); console.log('[selectService] 3-char match:', text); await page.waitForTimeout(800); return;
           }
         }
-        await page.keyboard.press("ArrowDown");
-        await page.keyboard.press("Enter");
-        console.log('[selectService] Final fallback ArrowDown+Enter');
-        await page.waitForTimeout(800);
+        if (c2 > 0) { await items2.first().click({ timeout: 8000 }); console.log('[selectService] 3-char first fallback'); await page.waitForTimeout(800); return; }
+      }
+    }
+    if (attempt < 2) await page.waitForTimeout(600);
+  }
+  await page.waitForTimeout(500);
+  // Verify field has a value
+  const val = await serviceInput.inputValue().catch(() => '');
+  console.log('[selectService] final field value:', val.substring(0,40));
+}
+
+async function handleRequestTypeModal(page) {
+  // After selecting staff, SalonBiz may show a "Request Type" modal
+  // We just pick "Return Request" (RR) for returning clients or first available
+  await page.waitForTimeout(1000);
+  const modal = page.locator('ngb-modal-window').first();
+  const isOpen = await modal.isVisible().catch(() => false);
+  if (!isOpen) { console.log('[requestType] No modal open'); return; }
+
+  const title = await modal.locator('.modal-title, h4, h5').first().innerText().catch(() => '');
+  console.log('[requestType] Modal title:', title);
+  if (!title.toLowerCase().includes('request') && !title.toLowerCase().includes('type')) {
+    console.log('[requestType] Not a request type modal, skipping');
+    return;
+  }
+
+  console.log('[requestType] Request Type modal open - selecting Return Request or first option');
+
+  // Try to find and click "Return Request" row
+  const rows = modal.locator('table tbody tr, .sbiz-data-list__row:not(.sbiz-data-list__row--header), tr[role="row"]');
+  const rowCount = await rows.count().catch(() => 0);
+  let found = false;
+  for (let i = 0; i < rowCount; i++) {
+    const text = (await rows.nth(i).innerText().catch(() => '')).toLowerCase();
+    if (text.includes('return request') || text.includes('rnr') || text.includes('rr')) {
+      await rows.nth(i).click({ timeout: 8000 });
+      found = true;
+      console.log('[requestType] Selected Return Request');
+      break;
+    }
+  }
+  if (!found && rowCount > 0) {
+    // Pick "New Non-Request" or first
+    for (let i = 0; i < rowCount; i++) {
+      const text = (await rows.nth(i).innerText().catch(() => '')).toLowerCase();
+      if (text.includes('non-request') || text.includes('nnr')) {
+        await rows.nth(i).click({ timeout: 8000 });
+        found = true;
+        console.log('[requestType] Selected Non-Request');
         break;
       }
     }
-    if (attempt < 2) await page.waitForTimeout(500);
+    if (!found) {
+      await rows.first().click({ timeout: 8000 });
+      console.log('[requestType] Selected first request type');
+    }
+  }
+  await page.waitForTimeout(500);
+
+  // Click "Select Request Type" button
+  const selectBtn = modal.locator('button:has-text("Select Request Type"), button:has-text("Select")').last();
+  if (await selectBtn.isVisible().catch(() => false)) {
+    await selectBtn.click({ timeout: 10000 });
+    console.log('[requestType] Clicked Select Request Type');
+  }
+  await page.waitForTimeout(1500);
+}
+
+async function selectStaffViaModal(page, stylistFirstName) {
+  // The staff cell opens a "Staff Members" modal when clicked/typed into
+  // We need to: open modal, find stylist by name, click row, click "Select Staff Member"
+  const panel = page.locator("sbiz-book-right-panel");
+  const staffInput = panel.locator('input[formcontrolname="staff"]').first();
+
+  // Check if staff input is visible
+  const staffVisible = await staffInput.isVisible().catch(() => false);
+  if (!staffVisible) {
+    console.log('[selectStaff] staff input not visible, skipping');
+    return false;
   }
 
-  await page.waitForTimeout(500);
+  // Triple-click + Delete opens the Staff Members modal
+  await staffInput.click({ timeout: 10000, clickCount: 3 });
+  await page.keyboard.press('Delete');
+  await page.waitForTimeout(1500);
+
+  // Check if Staff Members modal opened
+  const staffModal = page.locator('text="Staff Members"').first();
+  const modalOpen = await staffModal.isVisible().catch(() => false);
+  if (!modalOpen) {
+    // Try typing a character instead
+    await staffInput.click({ timeout: 8000 });
+    await staffInput.type('a', { delay: 50 });
+    await page.waitForTimeout(1500);
+  }
+
+  // Look for the modal
+  const modal = page.locator('ngb-modal-window').first();
+  const isModalOpen = await modal.isVisible().catch(() => false);
+
+  if (!isModalOpen) {
+    console.log('[selectStaff] Staff Members modal did not open - trying to proceed without staff selection');
+    // Clear the input and move on
+    await staffInput.fill('').catch(() => {});
+    return false;
+  }
+
+  console.log('[selectStaff] Staff Members modal open');
+
+  // If a specific stylist was requested, search for them
+  if (stylistFirstName) {
+    const searchBox = modal.locator('input[placeholder], input[type="text"]').last();
+    if (await searchBox.isVisible().catch(() => false)) {
+      await searchBox.click();
+      await searchBox.fill(stylistFirstName);
+      await page.waitForTimeout(1000);
+    }
+  }
+
+  // Find staff rows - look for rows with the stylist name
+  const staffRows = modal.locator('table tbody tr, .sbiz-data-list__row:not(.sbiz-data-list__row--header), tr[role="row"]');
+  const rowCount = await staffRows.count().catch(() => 0);
+  console.log('[selectStaff] Staff rows found:', rowCount);
+
+  if (rowCount === 0) {
+    // No staff found with this filter - if we searched, clear and show all
+    if (stylistFirstName) {
+      const searchBox = modal.locator('input[placeholder], input[type="text"]').last();
+      const clearBtn = modal.locator('button:has-text("×"), [aria-label="Clear"], button.clear').first();
+      if (await clearBtn.isVisible().catch(() => false)) await clearBtn.click();
+      else if (await searchBox.isVisible().catch(() => false)) await searchBox.fill('');
+      await page.waitForTimeout(1000);
+    }
+    // Try clicking first available row
+    const allRows = modal.locator('table tbody tr, tr[role="row"]');
+    const allCount = await allRows.count().catch(() => 0);
+    console.log('[selectStaff] All rows after clear:', allCount);
+    if (allCount > 0) {
+      await allRows.first().click({ timeout: 8000 });
+      await page.waitForTimeout(500);
+    }
+  } else {
+    // Try to find the requested stylist
+    let found = false;
+    if (stylistFirstName) {
+      const nameLower = stylistFirstName.toLowerCase();
+      for (let i = 0; i < rowCount; i++) {
+        const rowText = (await staffRows.nth(i).innerText().catch(() => '')).toLowerCase();
+        if (rowText.includes(nameLower)) {
+          await staffRows.nth(i).click({ timeout: 8000 });
+          found = true;
+          console.log('[selectStaff] Found and clicked:', rowText.substring(0,50));
+          break;
+        }
+      }
+    }
+    if (!found) {
+      // Click first available row
+      await staffRows.first().click({ timeout: 8000 });
+      const firstRowText = await staffRows.first().innerText().catch(() => '');
+      console.log('[selectStaff] Clicked first row:', firstRowText.substring(0,50));
+    }
+  }
+  await page.waitForTimeout(600);
+
+  // Click "Select Staff Member" button
+  const selectBtn = modal.locator('button:has-text("Select Staff Member"), button:has-text("Select")').last();
+  if (await selectBtn.isVisible().catch(() => false)) {
+    await selectBtn.click({ timeout: 10000 });
+    console.log('[selectStaff] Clicked Select Staff Member');
+  }
+  await page.waitForTimeout(1500);
+
+  // Handle Request Type modal that appears after staff selection
+  await handleRequestTypeModal(page);
+
+  return true;
 }
+
 async function selectExistingClient(page, nameStr, phoneStr) {
   const { firstName, lastName } = splitName(nameStr);
   const phoneDigits = digitsOnly(phoneStr || '').slice(-10);
@@ -1240,21 +1371,11 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
   }
 
   await selectService(page, service); await page.waitForTimeout(1500);
-  // Wait for staff input to be visible before interacting
-  const staffInput = panel.locator('input[formcontrolname="staff"]').first();
-  if (stylist) {
-    let staffVisible = await staffInput.isVisible().catch(() => false);
-    if (!staffVisible) {
-      console.log('[runBooking] staff input not visible yet, waiting 3s...');
-      await page.waitForTimeout(3000);
-      staffVisible = await staffInput.isVisible().catch(() => false);
-    }
-    if (staffVisible) {
-      await typeaheadSelect(staffInput, stylist);
-    } else {
-      console.log('[runBooking] staff input still not visible, skipping stylist selection');
-    }
-  }
+  // Select staff via the Staff Members modal (SalonBiz uses a modal, not a typeahead)
+  console.log('[runBooking] Selecting staff via modal for:', stylist || 'any available');
+  await selectStaffViaModal(page, stylist || null);
+  await page.waitForTimeout(1000);
+  // Set the start time
   await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
   await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
   if (requestReason) {
