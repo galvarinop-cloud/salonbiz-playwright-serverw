@@ -772,7 +772,7 @@ async function selectService(page, serviceStr) {
     await page.keyboard.press("ArrowDown");
     await page.waitForTimeout(300);
     await page.keyboard.press("Enter");
-    console.log("[selectService] Used ArrowDown+Enter fallback");
+    console.log('[selectService] Used ArrowDown+Enter fallback'); await page.waitForTimeout(800);
   }
 
   await page.waitForTimeout(500);
@@ -1025,9 +1025,9 @@ async function clickFinalAppointmentCreate(page) {
   for (const loc of candidates) {
     const count = await loc.count().catch(() => 0);
     if (count > 0) {
-      const btn = loc.last();
-      const visible = await btn.isVisible().catch(() => false);
-      if (visible) { await btn.click({ timeout: 15000 }); return true; }
+      const btn = loc.last(); await btn.waitFor({state:'visible', timeout: 5000}).catch(()=>{}); const enabled = await btn.evaluate(el => !el.disabled && !el.hasAttribute('disabled')).catch(()=>false); if (enabled) { await btn.click({ timeout: 15000 }); return true; } const visible = await btn.isVisible().catch(()=>false); if (visible) { try { await btn.click({timeout: 15000, force: true}); return true; } catch(e) { console.warn('[createBtn] click failed:', e.message); } }
+      // visible check already handled above
+      // handled above
     }
   }
   return false;
@@ -1117,7 +1117,7 @@ async function runBooking(page, { isNewClient, customerName, customerPhone, cust
     }
   }
 
-  await selectService(page, service);
+  await selectService(page, service); await page.waitForTimeout(1500);
   if (stylist) await typeaheadSelect(panel.locator('input[formcontrolname="staff"]').first(), stylist);
   await setTextInput(panel.locator('input[formcontrolname="startTime"]').first(), startTime);
   await setTextInput(panel.locator('input[formcontrolname="customDuration"]').first(), customDuration);
