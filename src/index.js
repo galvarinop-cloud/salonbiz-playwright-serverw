@@ -1630,7 +1630,16 @@ async function warmApptCacheForNextDays(numDays = 5) {
       const dateStr = formatYYYYMMDD(scanDate);
       try {
         await navigateToDate(page, dateStr);
-        await page.waitForTimeout(1500);
+        // Wait for Angular to render appointment blocks (up to 8s)
+        await page.waitForTimeout(2000);
+        try {
+          await page.waitForSelector('.scheduler-appointment-block__container, .staff-header-item', {
+            state: 'attached', timeout: 6000
+          });
+          await page.waitForTimeout(500); // Extra wait for all blocks to render
+        } catch (waitErr) {
+          // No blocks found yet - likely closed day or no appointments - continue
+        }
         // Scrape appointments using DOM structure (no bounding boxes needed in headless)
           const scrapedData = await page.evaluate(() => {
             const result = { appointments: [], stylistAppts: {} };
