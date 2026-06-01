@@ -934,18 +934,16 @@ async function selectStaffViaModal(page, stylistFirstName) {
   }
   console.log('[selectStaff] All row texts:', JSON.stringify(rowTexts));
 
-  // A real staff row has at least 2 words (First Last name) and is NOT a lone category label.
-  // Category labels like "Artistic Educator" appear with no tab-separated columns.
-  // Real staff rows have name + columns separated by tabs/newlines.
+  // A real staff row: has 2+ words looking like a name (First Last)
+  // Avoid 	 and 
+ literals - check string parts count instead
   const isRealStaffRow = (text) => {
     const t = text.trim();
     if (!t || t.toLowerCase().includes('no records')) return false;
-    // Has tab or newline = multi-column row = real data
-    if (t.includes('	') || t.includes('
-')) return true;
-    // Single line with 2+ capitalized words = likely a name
-    const words = t.split(/s+/).filter(w => w.length > 1);
-    if (words.length >= 2 && /^[A-Z]/.test(words[0]) && /^[A-Z]/.test(words[1])) return true;
+    // Split on whitespace to get word count
+    const parts = t.split(/[\s\t\n]+/).filter(w => w.length > 1);
+    // Real name rows have 2+ words, each starting with uppercase
+    if (parts.length >= 2 && /^[A-Z]/.test(parts[0]) && /^[A-Z]/.test(parts[1])) return true;
     return false;
   };
 
